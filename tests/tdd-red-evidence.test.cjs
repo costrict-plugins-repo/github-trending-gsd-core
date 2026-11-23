@@ -1,0 +1,2257 @@
+'use strict';
+
+/**
+ * RED-evidence classification for `type: tdd` plans (#3770).
+ *
+ * Module: gsd-core/bin/lib/tdd-red-evidence.cjs (compiled from src/tdd-red-evidence.cts)
+ * Gate: `check tdd-red-evidence <record.json>` in gate-tdd-red-evidence.cjs (routed by check-command-router.cjs)
+ *
+ * #3770: the TDD executor accepted ANY nonzero test command as RED. Syntax
+ * errors, zero-test discovery, fixture crashes, parser errors, and unrelated
+ * assertions all authorized production edits (GREEN). Only an intentional
+ * failure of the TARGET test for the planned behavior may advance to GREEN;
+ * every other nonzero outcome is INVALID_RED.
+ *
+ * Row numbers map to .gsd/bug/fix-3770-tdd-red-evidence/50-test-matrix.md.
+ * TAP fixtures below are captured verbatim from `node --test --test-reporter tap`
+ * (Node v26) for each failure class.
+ */
+
+const { describe, test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const fc = require('fast-check');
+
+const { cleanup, runGsdTools } = require('./helpers.cjs');
+const {
+  classifyRedEvidence,
+  buildRedEvidenceRecord,
+} = require('../gsd-core/bin/lib/tdd-red-evidence.cjs');
+const { parseTestReport } = require('../gsd-core/bin/lib/report-parser.cjs');
+
+// ─── TAP fixtures (captured from node --test --test-reporter tap) ─────────────
+
+/** Row 1: intentional target failure — `not ok 1 - rejects empty email`, # fail 1, exit 1. */
+const TARGET_FAILURE_TAP = [
+  'TAP version 13',
+  '# Subtest: rejects empty email',
+  'not ok 1 - rejects empty email',
+  '  ---',
+  '  duration_ms: 1.15',
+  "  error: 'Expected values to be strictly equal. 1 !== 2'",
+  "  code: 'ERR_ASSERTION'",
+  '  ...',
+  '1..1',
+  '# tests 1',
+  '# suites 0',
+  '# pass 0',
+  '# fail 1',
+  '# cancelled 0',
+  '# skipped 0',
+  '# todo 0',
+  '# duration_ms 46.8',
+  '',
+].join('\n');
+
+/** Rows 2: zero-test discovery — discovery matched zero tests, harness exits nonzero. */
+const ZERO_TESTS_TAP = [
+  'TAP version 13',
+  '1..0',
+  '# tests 0',
+  '# suites 0',
+  '# pass 0',
+  '# fail 0',
+  '# cancelled 0',
+  '# skipped 0',
+  '# todo 0',
+  '# duration_ms 3.1',
+  '',
+].join('\n');
+
+/** Row 3: fixture crash / load throw — the failure is FILE-NAMED, not the target test. */
+const FIXTURE_CRASH_TAP = [
+  'TAP version 13',
+  '# Subtest: crash.test.cjs',
+  'not ok 1 - crash.test.cjs',
+  '  ---',
+  '  duration_ms: 28.3',
+  "  type: 'test'",
+  '  location: \'crash.test.cjs:1:1\'',
+  "  failureType: 'testCodeFailure'",
+  '  exitCode: 1',
+  "  error: 'test failed'",
+  "  code: 'ERR_TEST_FAILURE'",
+  '  ...',
+  '1..1',
+  '# tests 1',
+  '# suites 0',
+  '# pass 0',
+  '# fail 1',
+  '# cancelled 0',
+  '# skipped 0',
+  '# todo 0',
+  '# duration_ms 28.3',
+  '',
+].join('\n');
+
+/** Row 6: an unrelated test fails — a real assertion, but not the target test. */
+const UNRELATED_FAILURE_TAP = TARGET_FAILURE_TAP.replaceAll(
+  'rejects empty email',
+  'unrelated legacy behavior',
+);
+
+function validRedInput(overrides = {}) {
+  return {
+    command: 'node --test tests/email.test.cjs',
+    exitCode: 1,
+    output: TARGET_FAILURE_TAP,
+    targetTest: 'rejects empty email',
+    targetFile: 'tests/email.test.cjs',
+    expected: 'ValidationError for empty input',
+    actual: '1 !== 2',
+    ...overrides,
+  };
+}
+
+// ─── Pure classifier (#3770 regression rows) ─────────────────────────────────
+
+describe('classifyRedEvidence (#3770)', () => {
+  test('row 1 — classifyRedEvidence accepts intentional target failure', () => {
+    const result = classifyRedEvidence(validRedInput());
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK', 'an intentional target failure is the only valid RED');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.equal(result.evidence.failing_tests[0], 'rejects empty email');
+    assert.equal(result.evidence.exit_code, 1);
+  });
+
+  test('row 2 — classifyRedEvidence rejects zero-test discovery', () => {
+    const result = classifyRedEvidence(validRedInput({ output: ZERO_TESTS_TAP }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'zero_tests_discovered');
+  });
+
+  test('row 3 — classifyRedEvidence rejects fixture crash', () => {
+    const result = classifyRedEvidence(
+      validRedInput({ output: FIXTURE_CRASH_TAP, targetFile: 'tests/crash.test.cjs' }),
+    );
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'fixture_or_load_failure');
+  });
+
+  test('row 4 — classifyRedEvidence rejects nonzero exit without a failing test', () => {
+    const result = classifyRedEvidence(validRedInput({ output: 'TAP version 13\nok 1 - rejects empty email\n1..1\n' }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'nonzero_exit_without_test_failure');
+  });
+
+  test('row 5 — classifyRedEvidence rejects unexpected green', () => {
+    const result = classifyRedEvidence(validRedInput({ exitCode: 0 }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'unexpected_green');
+  });
+
+  test('row 6 — classifyRedEvidence rejects unrelated failing test', () => {
+    const result = classifyRedEvidence(validRedInput({ output: UNRELATED_FAILURE_TAP }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+  });
+
+  test('fail-closed — malformed record fields are INVALID_RED, never a crash', () => {
+    const result = classifyRedEvidence({ command: null, exitCode: '1', output: 42, targetTest: '' });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+  });
+
+  test('#4692: an exit code that is not a non-negative integer is an invalid record', () => {
+    for (const exitCode of [-1, 1.5, '1', null]) {
+      const result = classifyRedEvidence(validRedInput({ exitCode }));
+      assert.equal(result.reason, 'invalid_record', JSON.stringify(exitCode));
+    }
+    assert.equal(classifyRedEvidence(validRedInput({ exitCode: 137 })).verdict, 'RED_EVIDENCE_OK');
+  });
+});
+
+// ─── Persisted record (acceptance: command, exit code, failing test, expected, actual) ──
+
+describe('buildRedEvidenceRecord (#3770)', () => {
+  test('row 7 — buildRedEvidenceRecord persists the RED evidence fields', () => {
+    const input = validRedInput();
+    const result = classifyRedEvidence(input);
+    const record = buildRedEvidenceRecord(input, result);
+    assert.equal(record.command, 'node --test tests/email.test.cjs');
+    assert.equal(record.exit_code, 1);
+    assert.equal(record.failing_test, 'rejects empty email');
+    assert.equal(record.expected, 'ValidationError for empty input');
+    assert.equal(record.actual, '1 !== 2');
+    assert.equal(record.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(record.reason, 'target_test_failed');
+  });
+});
+
+// ─── check tdd-red-evidence router arm ────────────────────────────────────────
+
+describe('check tdd-red-evidence verb (#3770)', () => {
+  /** Root for record-file fixtures; removed in after(). */
+  let ROOT = '';
+
+  before(() => { ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-red-evidence-')); });
+  after(() => cleanup(ROOT));
+
+  function writeRecord(name, record) {
+    const file = path.join(ROOT, name);
+    fs.writeFileSync(file, JSON.stringify(record), 'utf8');
+    return file;
+  }
+
+  test('row 8 — check tdd-red-evidence accepts a valid persisted record', () => {
+    const file = writeRecord('valid.json', validRedInput());
+    const result = runGsdTools(['check', 'tdd-red-evidence', file, '--raw'], ROOT);
+    assert.ok(result.success, `expected success, stderr: ${result.error}`);
+    const payload = JSON.parse(result.output);
+    assert.equal(payload.passed, true);
+    assert.equal(payload.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(payload.reason, 'target_test_failed');
+  });
+
+  test('row 9 — check tdd-red-evidence rejects a crash record', () => {
+    const file = writeRecord(
+      'crash.json',
+      validRedInput({ output: FIXTURE_CRASH_TAP, targetFile: 'tests/crash.test.cjs' }),
+    );
+    const result = runGsdTools(['check', 'tdd-red-evidence', file, '--raw'], ROOT);
+    const payload = JSON.parse(result.output);
+    assert.equal(payload.passed, false);
+    assert.equal(payload.verdict, 'INVALID_RED');
+    assert.equal(payload.reason, 'fixture_or_load_failure');
+  });
+
+  test('row 10 — check tdd-red-evidence fails closed on missing record', () => {
+    const result = runGsdTools(
+      ['check', 'tdd-red-evidence', path.join(ROOT, 'does-not-exist.json'), '--raw'],
+      ROOT,
+    );
+    const payload = JSON.parse(result.output);
+    assert.equal(payload.passed, false);
+    assert.equal(payload.verdict, 'INVALID_RED');
+    assert.equal(payload.reason, 'unreadable_record');
+  });
+});
+
+// ─── Spec surfaces (#3770 acceptance: gate must require evidence before GREEN) ─
+
+describe('executor requires format-based RED evidence (#4692)', () => {
+  const read = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
+  // Read inside each test: a missing reference fails that test instead of
+  // throwing before any test registers.
+  const canonical = () => read('gsd-core/references/tdd.md');
+  const runtime = () => read('gsd-core/references/execute-mvp-tdd.md');
+
+  test('#4692: TAP and JUnit share mandatory classification, with no Vitest exemption', () => {
+    assert.match(canonical(), /report format/);
+    assert.match(canonical(), /shared TAP adapter[^\n]*Node[^\n]*Vitest/);
+    assert.match(canonical(), /JUnit XML adapter[^\n]*Surefire\/Failsafe/);
+    assert.match(canonical(), /`gsd_run check tdd-red-evidence <record\.json> --raw`[^\n]*require `RED_EVIDENCE_OK` before GREEN/);
+    assert.match(canonical(), /unsupported format requires a supported reporter or a parser adapter before GREEN/);
+    assert.match(canonical(), /Classifier rejection never authorizes a fallback to self-attestation/);
+  });
+
+  test('#4692: reruns and current Maven reports retain evidence provenance', () => {
+    assert.match(canonical(), /reporter is incompatible[^\n]*rerun the planned target[^\n]*submit the rerun's record to the classifier/);
+    assert.match(canonical(), /unmodified report/);
+    assert.match(canonical(), /target\/surefire-reports\/TEST-\*\.xml[^\n]*target\/failsafe-reports\/TEST-\*\.xml/);
+    assert.match(canonical(), /require the report to be newer than the run start/);
+    assert.match(canonical(), /Missing, stale, or ambiguous reports require STOP/);
+  });
+
+  test('#4692: a parser pass still requires the intended target assertion to fail', () => {
+    const assessment = canonical().split('\n').find((line) => line.includes('After machine validation'));
+    assert.ok(assessment, 'RED step 4 has a semantic-assessment bullet');
+    assert.match(assessment, /target actually executed[^\n]*planned assertion[^\n]*intended reason/);
+    for (const stop of ['zero tests', 'skipped', 'setup', 'collection', 'import', 'syntax', 'fixture', 'unrelated', 'unexpected green', 'incomplete', 'ambiguous']) {
+      assert.match(assessment, new RegExp(stop, 'i'), stop);
+    }
+    for (const reason of ['unexpected_green', 'zero_tests_discovered', 'nonzero_exit_without_test_failure', 'fixture_or_load_failure', 'no_target_test_failure', 'invalid_record', 'unreadable_record']) {
+      assert.ok(canonical().includes('`' + reason + '`'), reason);
+    }
+  });
+
+  test('row 11 — the executor and tdd.md name INVALID_RED and the tdd-red-evidence check', () => {
+    for (const content of [read('agents/gsd-executor.md'), canonical()]) {
+      assert.match(content, /INVALID_RED/);
+      assert.match(content, /tdd-red-evidence/);
+    }
+    // execute-mvp-tdd.md delegates the check to tdd.md but must still halt on the verdict.
+    assert.match(runtime(), /INVALID_RED[^\n]{0,120}(block|halt|trip|STOP)/i);
+  });
+
+  test('#4692: the runtime gate loads the canonical evidence contract before GREEN', () => {
+    assert.match(runtime(), /Read `gsd-core\/references\/tdd\.md`, "Red-Green-Refactor Cycle", RED step 4/);
+    assert.match(runtime(), /follow its complete evidence contract before GREEN/);
+    assert.match(runtime(), /`INVALID_RED` verdict[^\n]*trips this gate/);
+    assert.match(runtime(), /self-attestation cannot substitute for machine validation/);
+    assert.match(read('agents/gsd-executor.md'), /references\/tdd\.md[^\n]*"Gate Enforcement Rules"/);
+  });
+});
+
+// ── #4724 — Surefire/Failsafe XML RED evidence ────────────────────────────────
+// A JVM project's genuine red is a Surefire/Failsafe XML report, not node:test
+// TAP. The gate used to parse only TAP, so a real Maven red scored
+// INVALID_RED while hand-written synthetic TAP scored RED_EVIDENCE_OK — the
+// gate was passable only by fabricating its input. The XML scanner walks
+// <testcase> tag boundaries (NOT a lazy spanning regex: Surefire writes
+// passing cases self-closing, so `(.*?)</testcase>` spans from a green case
+// to the next closing tag and reports wrong method names).
+
+describe('#4724 — Surefire/Failsafe XML RED evidence', () => {
+  const XML_HEAD = '<?xml version="1.0" encoding="UTF-8"?>\n';
+
+  function surefire(cases) {
+    const body = cases.join('\n');
+    return `${XML_HEAD}<testsuite name="com.example.AppTest" tests="${cases.length}" failures="1" errors="0">\n${body}\n</testsuite>`;
+  }
+
+  const failingCase = (cls, name) =>
+    `<testcase name="${name}" classname="${cls}" time="0.01"><failure message="expected 1 was 2">1 != 2</failure></testcase>`;
+  const errorCase = (cls, name) =>
+    `<testcase name="${name}" classname="${cls}" time="0.01"><error message="boom">NullPointerException</error></testcase>`;
+  const greenCase = (cls, name) =>
+    `<testcase name="${name}" classname="${cls}" time="0.01"/>`;
+
+  const INPUT = {
+    command: 'mvn -Dtest=AppTest test',
+    exitCode: 1,
+    targetTest: 'AppTest',
+    targetFile: 'src/test/java/com/example/AppTest.java',
+  };
+
+  test('a genuine Surefire red with the target class failing classifies RED_EVIDENCE_OK (#4724)', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: surefire([failingCase('com.example.AppTest', 'divides_by_zero')]),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.equal(result.evidence.fail, 1);
+    assert.ok(
+      result.evidence.failing_tests.some((n) => n.includes('AppTest')),
+      'failing_tests must carry the classname so the target matches',
+    );
+  });
+
+  test('an unrelated Surefire failure is not the target test', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: surefire([failingCase('com.other.UnrelatedTest', 'unrelated_case')]),
+    });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+  });
+
+  test('an all-green self-closing Surefire report is unexpected_green', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      exitCode: 0,
+      output: surefire([greenCase('com.example.AppTest', 'passes'), greenCase('com.example.AppTest', 'passes2')]),
+    });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'unexpected_green');
+  });
+
+  test('self-closing passing cases are not spanned into failing names (#4725-class trap)', () => {
+    // The issue's trap: a lazy /(.*?)<\/testcase>/ regex starting at the green
+    // self-closing case spans to the NEXT closing tag, misreporting the green
+    // case's name beside the failing one. Boundary scanning must not.
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: surefire([
+        greenCase('com.example.AppTest', 'green_before_failure'),
+        failingCase('com.example.AppTest', 'the_real_failure'),
+      ]),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(
+      result.evidence.failing_tests,
+      ['com.example.AppTest#the_real_failure'],
+      'exactly the failing case is reported — no spanned green-case names',
+    );
+  });
+
+  test('an <error> child counts as a failing testcase', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: surefire([errorCase('com.example.AppTest', 'explodes')]),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('a testcase-free Surefire report is zero_tests_discovered', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: `${XML_HEAD}<testsuite name="com.example.AppTest" tests="0" failures="0" errors="0"></testsuite>`,
+    });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'zero_tests_discovered');
+  });
+
+  test('Failsafe XML (same schema) classifies like Surefire', () => {
+    const result = classifyRedEvidence({
+      command: 'mvn -Dtest=AppIT verify',
+      exitCode: 1,
+      targetTest: 'AppIT',
+      targetFile: 'src/test/java/com/example/AppIT.java',
+      output: `${XML_HEAD}<testsuite name="com.example.AppIT" tests="1" failures="1" errors="0">\n${failingCase('com.example.AppIT', 'integration_red')}\n</testsuite>`,
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+  });
+});
+
+// ── #4724 review hardening — scanner edge cases ──────────────────────────────
+
+test('#4724: a <testcase with no > (truncated output) terminates and fails closed', () => {
+  // Pre-hardening this hung forever: indexOf('<testcase', -1) clamps to 0 and
+  // re-found the same tag. Degrade to what was scanned — an incomplete report
+  // proves nothing.
+  const result = classifyRedEvidence({
+    command: 'mvn test',
+    exitCode: 1,
+    targetTest: 'AppTest',
+    output: '<?xml version="1.0"?><testsuite><testcase name="x" classname="C"',
+  });
+  assert.equal(result.verdict, 'INVALID_RED');
+});
+
+test('#4724: a TAP red whose message quotes <testsuite> stays on the TAP path', () => {
+  // Format detection requires BOTH <testsuite and <testcase: a genuine TAP
+  // red whose error message merely quotes "<testsuite>" must not flip to the
+  // XML path (which would misread it as zero_tests_discovered).
+  const tap = [
+    'TAP version 13',
+    '# Subtest: the test',
+    'not ok 1 - expected <testsuite> was 2',
+    '  ---',
+    '    error: |-',
+    '      expected <testsuite> was 2',
+    '  ...',
+    '1..1',
+    '# tests 1',
+    '# pass 0',
+    '# fail 1',
+  ].join('\n');
+  const result = classifyRedEvidence({
+    command: 'node --test',
+    exitCode: 1,
+    targetTest: 'the test',
+    output: tap,
+  });
+  assert.equal(result.status ?? result.verdict, 'INVALID_RED');
+  assert.equal(result.reason, 'no_target_test_failure',
+    'the TAP path must classify it (fail=1), not the XML path (zero tests)');
+  assert.equal(result.evidence.fail, 1);
+});
+
+test('#4724: CDATA sections in a passing case are never scanned as failures', () => {
+  // A passing case whose captured System.out (CDATA) echoes an <error .../>
+  // literal must not count as failing — CDATA is verbatim content.
+  const cd = '<testcase name="prints" classname="com.example.AppTest"><system-out><![CDATA[echo <error x/></system-out>]]></system-out></testcase>';
+  const fl = '<testcase name="x" classname="com.other.Unrelated"><failure message="e">1 != 2</failure></testcase>';
+  const result = classifyRedEvidence({
+    command: 'mvn test',
+    exitCode: 1,
+    targetTest: 'UnrelatedTest',
+    output: `<?xml version="1.0"?>\n<testsuite>\n${cd}\n${fl}\n</testsuite>`,
+  });
+  assert.equal(result.reason, 'no_target_test_failure',
+    'the CDATA phantom must not flip the unrelated failure into a target match');
+  assert.equal(result.evidence.fail, 1, 'only the real failing case counts');
+});
+
+// ── #4957 — swift-testing RED evidence ────────────────────────────────────────
+// Same class as #4692 (Vitest) and #4724 (Surefire, fixed by #4825): swift-testing's
+// console summary (`✘ Test run with N tests in M suites failed after T seconds with
+// K issues.` plus per-test lines `✘ Test "name" failed after T seconds with K issues.`)
+// matched neither the TAP nor the Surefire detector, so a genuine Swift red silently
+// fell through to the TAP parser, which found nothing and reported zero tests.
+
+describe('#4957 — swift-testing RED evidence', () => {
+  const INPUT = {
+    command: 'swift test',
+    exitCode: 1,
+    targetTest: 'X',
+  };
+
+  function swiftTesting(perTestLines, { tests, passed = false } = {}) {
+    const failCount = perTestLines.filter((l) => l.includes('failed')).length;
+    const agg = passed
+      ? `✔ Test run with ${tests} tests in 1 suite passed after 0.02 seconds.`
+      : `✘ Test run with ${tests} tests in 1 suite failed after 0.02 seconds with ${failCount} issues.`;
+    return [agg, ...perTestLines].join('\n');
+  }
+  const failLine = (name) => `✘ Test "${name}" failed after 0.01 seconds with 1 issue.`;
+  const passLine = (name) => `✔ Test "${name}" passed after 0.01 seconds.`;
+
+  test('a genuine swift-testing red with the target test failing classifies RED_EVIDENCE_OK (#4957)', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([passLine('Y'), failLine('X')], { tests: 2 }),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.equal(result.evidence.tests, 2);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test("the issue's literal aggregate-only repro is an incomplete report, not zero_tests_discovered (#4957)", () => {
+    // The issue's exact repro JSON: only the aggregate summary line, no per-test
+    // lines at all. We cannot identify which named test failed, so this must NOT
+    // reach RED_EVIDENCE_OK — but it must also never lie that zero tests ran.
+    // Like a TAP plan or JUnit count mismatch, the report is incomplete.
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: '✘ Test run with 3 tests in 1 suite failed after 0.004 seconds with 6 issues.\n',
+    });
+    assert.notEqual(result.reason, 'zero_tests_discovered');
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.equal(result.evidence.format, 'swift-testing');
+    assert.deepEqual(result.evidence.report_errors, ['Incomplete swift-testing report']);
+  });
+
+  test('an unrelated swift-testing failure is not the target test', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([failLine('Y')], { tests: 1 }),
+    });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+  });
+
+  test('an all-passed swift-testing report at exit 0 is unexpected_green', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      exitCode: 0,
+      output: swiftTesting([passLine('X'), passLine('Y')], { tests: 2, passed: true }),
+    });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'unexpected_green');
+  });
+
+  test('exactly one failing swift-testing test (boundary: fail=1) still matches the target', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([failLine('X')], { tests: 1 }),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('a target failing among several passing swift-testing tests still matches', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting(
+        [passLine('A'), passLine('B'), passLine('C'), passLine('D'), failLine('X')],
+        { tests: 5 },
+      ),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.evidence.tests, 5);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('skipped, cancelled, known-issue and parameterized siblings count toward the aggregate', () => {
+    // swift-testing counts started AND skipped tests in "Test run with N tests",
+    // and a parameterized test ends with "with N test cases" before its verb.
+    // Line shapes come from swiftlang/swift-testing
+    // Sources/Testing/Events/Recorder/Event.HumanReadableOutputRecorder.swift
+    // (testEnded, testSkipped, _issueCounts) and Event.Symbol.swift (➜ skip, ━ known-issue pass).
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([
+        '➜ Test "S" skipped.',
+        '➜ Test "R" skipped: "needs network"',
+        '➜ Test "C" was cancelled after 0.01 seconds.',
+        '━ Test "K" passed after 0.01 seconds with 1 known issue.',
+        '✔ Test "P" with 3 test cases passed after 0.01 seconds.',
+        failLine('X'),
+      ], { tests: 6 }),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.tests, 6);
+    assert.equal(result.evidence.pass, 2);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('a skipped or cancelled target is never RED evidence', () => {
+    for (const line of ['➜ Test "X" skipped.', '➜ Test "X" was cancelled after 0.01 seconds: "timeout"']) {
+      const result = classifyRedEvidence({ ...INPUT, output: swiftTesting([line, failLine('Y')], { tests: 2 }) });
+      assert.equal(result.verdict, 'INVALID_RED', line);
+      assert.equal(result.reason, 'no_target_test_failure', line);
+      assert.deepEqual(result.evidence.report_errors, [], line);
+    }
+  });
+
+  test('a known-issue run summary is still swift-testing, and a result line with trailing text is not a result', () => {
+    const knownIssueRun = [
+      '━ Test "X" passed after 0.01 seconds with 1 known issue.',
+      '━ Test run with 1 test in 1 suite passed after 0.02 seconds with 1 known issue.',
+    ].join('\n');
+    const green = classifyRedEvidence({ ...INPUT, exitCode: 0, output: knownIssueRun });
+    assert.equal(green.evidence.format, 'swift-testing');
+    assert.equal(green.reason, 'unexpected_green');
+    const trailing = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([`${failLine('X')} (retried)`], { tests: 1 }),
+    });
+    assert.equal(trailing.reason, 'invalid_record');
+    assert.deepEqual(trailing.evidence.report_errors, ['Incomplete swift-testing report']);
+  });
+
+  test('a failing parameterized target classifies RED_EVIDENCE_OK', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([
+        passLine('Y'),
+        '✘ Test "X" with 3 test cases failed after 0.01 seconds with 2 issues.',
+      ], { tests: 2 }),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.failing_tests, ['X']);
+  });
+
+  test('a stray swift-testing-looking per-test line with no aggregate marker is not a swift-testing report', () => {
+    // No "Test run with N tests in M suites ..." aggregate line present at all —
+    // must not be confidently classified as swift-testing off a per-test line alone.
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: failLine('X'),
+    });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.equal(result.evidence.format, 'unknown');
+  });
+
+  test('property: swift-testing target matching is exactly failing-set membership (#4957)', () => {
+    const arb = fc.integer({ min: 1, max: 12 }).chain((n) =>
+      fc.record({
+        n: fc.constant(n),
+        failingIdx: fc.subarray(
+          Array.from({ length: n }, (_, i) => i),
+          { minLength: 1 },
+        ),
+        targetIdx: fc.integer({ min: 0, max: n - 1 }),
+      }),
+    );
+    fc.assert(
+      fc.property(arb, ({ n, failingIdx, targetIdx }) => {
+        const failingSet = new Set(failingIdx);
+        const lines = [];
+        for (let i = 0; i < n; i++) {
+          lines.push(failingSet.has(i) ? failLine(`test${i}`) : passLine(`test${i}`));
+        }
+        const result = classifyRedEvidence({
+          command: 'swift test',
+          exitCode: 1,
+          targetTest: `test${targetIdx}`,
+          output: swiftTesting(lines, { tests: n }),
+        });
+        assert.equal(result.evidence.tests, n);
+        assert.equal(result.evidence.fail, failingSet.size);
+        if (failingSet.has(targetIdx)) {
+          assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+          assert.equal(result.reason, 'target_test_failed');
+        } else {
+          assert.equal(result.verdict, 'INVALID_RED');
+          assert.equal(result.reason, 'no_target_test_failure');
+        }
+      }),
+      { numRuns: 200, seed: 4957 },
+    );
+  });
+
+  test('a TAP diagnostic merely quoting the swift-testing summary phrase stays on the TAP path (review finding)', () => {
+    // The phrase appears mid-line, indented, quoted inside a TAP diagnostic's
+    // `actual:` block — NOT at line-start with a checkmark glyph. Must NOT
+    // hijack format detection away from the real TAP failure.
+    const tap = [
+      'TAP version 13',
+      '# Subtest: renders a CLI summary',
+      'not ok 1 - renders a CLI summary',
+      '  ---',
+      '  actual: |-',
+      '    Got: "Test run with 2 tests in 1 suite passed after 0.02 seconds."',
+      '  ...',
+      '1..1',
+      '# tests 1',
+      '# pass 0',
+      '# fail 1',
+    ].join('\n');
+    const result = classifyRedEvidence({
+      command: 'node --test',
+      exitCode: 1,
+      targetTest: 'renders a CLI summary',
+      output: tap,
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK', 'the real TAP failure must still be classified correctly');
+    assert.equal(result.evidence.tests, 1, 'tests must come from the real TAP summary, not the quoted phrase');
+  });
+
+  test('concatenated swift-testing blocks report a consistent summed test count (review finding)', () => {
+    const block1 = swiftTesting([passLine('A0'), failLine('A1')], { tests: 2 });
+    const block2 = swiftTesting([passLine('B'), passLine('C'), failLine('D')], { tests: 3 });
+    const result = classifyRedEvidence({
+      command: 'swift test',
+      exitCode: 1,
+      targetTest: 'D',
+      output: `${block1}\n${block2}`,
+    });
+    assert.equal(result.evidence.tests, 5, 'tests must be the sum of every aggregate block, not just the first');
+    assert.equal(result.evidence.pass + result.evidence.fail, 5, 'pass+fail must never exceed the reported tests');
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+  });
+
+  // Event.HumanReadableOutputRecorder names a test by its quoted display name
+  // only when it has one; a plain `@Test func` is named by its bare function
+  // name, and --verbose adds `(aka 'function()')` after a display name.
+  const bare = [
+    '✘ Test addsNumbers() failed after 0.001 seconds with 1 issue.',
+    '✔ Test subtracts() passed after 0.001 seconds.',
+  ];
+
+  test('a test without a display name is named by its bare function name', () => {
+    for (const targetTest of ['addsNumbers()', 'addsNumbers']) {
+      const result = classifyRedEvidence({ ...INPUT, targetTest, output: swiftTesting(bare, { tests: 2 }) });
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK', targetTest);
+      assert.deepEqual(result.evidence.report_errors, []);
+      assert.equal(result.evidence.matched_test, 'addsNumbers()');
+    }
+  });
+
+  test('a verbose display name also matches its function name', () => {
+    const output = swiftTesting([
+      `✘ Test "Adds numbers" (aka 'addsNumbers()') failed after 0.001 seconds with 1 issue.`,
+      `✔ Test "Subtracts" (aka 'subtracts()') passed after 0.001 seconds.`,
+    ], { tests: 2 });
+    for (const targetTest of ['Adds numbers', 'addsNumbers()', 'addsNumbers']) {
+      const result = classifyRedEvidence({ ...INPUT, targetTest, output });
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK', targetTest);
+      assert.equal(result.evidence.matched_test, 'Adds numbers');
+    }
+  });
+
+  test('Windows console glyphs mark the same results', () => {
+    // Event.Symbol substitutes √ × - for ✔ ✘ ━ on Windows.
+    const output = [
+      '× Test run with 2 tests in 1 suite failed after 0.002 seconds with 1 issue.',
+      '× Test addsNumbers() failed after 0.001 seconds with 1 issue.',
+      '√ Test subtracts() passed after 0.001 seconds.',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, targetTest: 'addsNumbers()', output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.report_errors, []);
+  });
+});
+
+// ── #4970 — Python unittest RED evidence ──────────────────────────────────────
+// Python stdlib `unittest` emits neither TAP nor JUnit XML: a genuine red was
+// falling through to the TAP parser (which finds nothing) and scoring
+// zero_tests_discovered — the Python sibling of #4692 (Vitest) and #4724
+// (Surefire). The aggregate line ("Ran N tests in Ts" + "OK"/"FAILED (...)")
+// and per-failure headers ("FAIL: name (id)" / "ERROR: name (id)") are parsed
+// directly; `tests` comes only from the aggregate (never fabricated from
+// counting FAIL lines), and `fail`/`failing_tests` come only from observed
+// FAIL:/ERROR: headers (absent headers means fail:0, not a fabricated match).
+
+describe('#4970 — Python unittest RED evidence', () => {
+  const INPUT = {
+    command: 'python -m unittest discover -s tests -v',
+    exitCode: 1,
+    targetTest: 'test_adds_two_numbers',
+    targetFile: 'tests/test_demo.py',
+  };
+
+  // The issue's literal repro (#4970), verbatim shape.
+  const ISSUE_REPRO = [
+    'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... FAIL',
+    '',
+    '======================================================================',
+    'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers)',
+    '----------------------------------------------------------------------',
+    'Traceback (most recent call last):',
+    '  File "tests/test_demo.py", line 10, in test_adds_two_numbers',
+    '    self.assertEqual(add(1, 2), 3)',
+    'AssertionError: 0 != 3',
+    '',
+    '----------------------------------------------------------------------',
+    'Ran 1 test in 0.001s',
+    '',
+    'FAILED (failures=1)',
+    '',
+  ].join('\n');
+
+  test('the issue-4970 literal repro classifies RED_EVIDENCE_OK', () => {
+    const result = classifyRedEvidence({ ...INPUT, output: ISSUE_REPRO });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.equal(result.evidence.tests, 1, 'tests count comes from "Ran 1 test", not fabricated');
+    assert.equal(result.evidence.fail, 1);
+    assert.deepEqual(result.evidence.failing_tests, ['test_adds_two_numbers']);
+  });
+
+  test('a genuine unittest red with the target test failing classifies RED_EVIDENCE_OK', () => {
+    const output = [
+      'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... FAIL',
+      '',
+      '======================================================================',
+      'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers)',
+      '----------------------------------------------------------------------',
+      'AssertionError: 0 != 3',
+      '',
+      'Ran 1 test in 0.002s',
+      '',
+      'FAILED (failures=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+  });
+
+  test('an unrelated unittest failure is not the target test', () => {
+    const output = [
+      'test_other (test_demo.AddTest.test_other) ... FAIL',
+      '',
+      '======================================================================',
+      'FAIL: test_other (test_demo.AddTest.test_other)',
+      '----------------------------------------------------------------------',
+      'AssertionError: boom',
+      '',
+      'Ran 1 test in 0.001s',
+      '',
+      'FAILED (failures=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+  });
+
+  test('an all-pass unittest run (OK) at exit 0 is unexpected_green', () => {
+    const output = ['', 'Ran 2 tests in 0.003s', '', 'OK', ''].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, exitCode: 0, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'unexpected_green');
+  });
+
+  test('an aggregate-only report with no FAIL/ERROR header is incomplete, not fabricated (fail:0)', () => {
+    // A truncated/aggregate-only report must never fabricate a target match —
+    // a counted failure without its header makes the report incomplete.
+    const output = ['', 'Ran 1 test in 0.001s', '', 'FAILED (failures=1)', ''].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.deepEqual(result.evidence.report_errors, ['Incomplete unittest report']);
+    assert.equal(result.evidence.fail, 0);
+    assert.deepEqual(result.evidence.failing_tests, []);
+  });
+
+  test('boundary: exactly one failing test among several classifies on the target', () => {
+    const output = [
+      'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers)',
+      '----------------------------------------------------------------------',
+      'AssertionError: 0 != 3',
+      '',
+      'Ran 3 tests in 0.004s',
+      '',
+      'FAILED (failures=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.evidence.tests, 3);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('boundary: several failing tests, target among them', () => {
+    const output = [
+      'FAIL: test_other (test_demo.AddTest.test_other)',
+      '----------------------------------------------------------------------',
+      'AssertionError: boom',
+      '',
+      'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers)',
+      '----------------------------------------------------------------------',
+      'AssertionError: 0 != 3',
+      '',
+      'Ran 3 tests in 0.004s',
+      '',
+      'FAILED (failures=2)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.evidence.fail, 2);
+    assert.deepEqual(result.evidence.failing_tests, ['test_other', 'test_adds_two_numbers']);
+  });
+
+  test('an ERROR header counts as failing, mirroring the Surefire <error> precedent', () => {
+    const output = [
+      'ERROR: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers)',
+      '----------------------------------------------------------------------',
+      'Traceback (most recent call last):',
+      'ZeroDivisionError: division by zero',
+      '',
+      'Ran 1 test in 0.001s',
+      '',
+      'FAILED (errors=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+  });
+
+  test('a unittest.loader._FailedTest collection/import failure is excluded, never fabricating a target match', () => {
+    // The issue's explicit carve-out: a module import/collection crash makes
+    // unittest synthesize a _FailedTest whose method name can coincidentally
+    // equal the plan's target test. This must NOT be fabricated into a real
+    // failure — the load failure invalidates the whole report.
+    const output = [
+      'ERROR: test_adds_two_numbers (unittest.loader._FailedTest.test_adds_two_numbers)',
+      '----------------------------------------------------------------------',
+      'ImportError: Failed to import test module: test_demo',
+      'Traceback (most recent call last):',
+      '  ModuleNotFoundError: No module named \'add\'',
+      '',
+      'Ran 1 test in 0.000s',
+      '',
+      'FAILED (errors=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.deepEqual(result.evidence.report_errors, ['unittest module failed to load']);
+    assert.equal(result.evidence.fail, 0, '_FailedTest must not be counted as a real failure');
+    assert.deepEqual(result.evidence.failing_tests, []);
+  });
+
+  test('a target failing in several subTests is one failing test, not an ambiguous or overcounted report', () => {
+    // Real Python 3.14 `-m unittest -v` output: each failing subTest prints its
+    // own identical FAIL: header, and failures= counts subTests while Ran
+    // counts methods (3 subTest failures > Ran 2).
+    const output = [
+      'test_ok (test_demo.AddTest.test_ok) ... ok',
+      'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... ',
+      '  test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=0) ... FAIL',
+      '  test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=1) ... FAIL',
+      '  test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=2) ... FAIL',
+      '',
+      ...[0, 1, 2].flatMap((i) => [
+        '======================================================================',
+        `FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=${i})`,
+        '----------------------------------------------------------------------',
+        'Traceback (most recent call last):',
+        '  File "tests/test_demo.py", line 10, in test_adds_two_numbers',
+        '    self.assertEqual(add(i, 2), i + 2)',
+        `AssertionError: 0 != ${i + 2}`,
+        '',
+      ]),
+      '----------------------------------------------------------------------',
+      'Ran 2 tests in 0.001s',
+      '',
+      'FAILED (failures=3)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.tests, 2);
+    assert.equal(result.evidence.pass, 1);
+    assert.equal(result.evidence.fail, 1);
+    assert.deepEqual(result.evidence.failing_tests, ['test_adds_two_numbers']);
+  });
+
+  // Real Python 3.14 `-m unittest -v` output: an @expectedFailure test that
+  // passes is listed as UNEXPECTED SUCCESS and counted in the FAILED line, but
+  // it is a test that ran and passed, not a failure.
+  const UNEXPECTED_SUCCESS = [
+    'test_known_bug (test_demo.AddTest.test_known_bug) ... unexpected success',
+    '',
+    '======================================================================',
+    'UNEXPECTED SUCCESS: test_known_bug (test_demo.AddTest.test_known_bug)',
+    '----------------------------------------------------------------------',
+    'Ran 2 tests in 0.000s',
+    '',
+  ];
+
+  test('an unexpected success beside the failing target still classifies RED_EVIDENCE_OK', () => {
+    const output = [
+      'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... FAIL',
+      ...UNEXPECTED_SUCCESS.slice(0, 2),
+      '======================================================================',
+      'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers)',
+      '----------------------------------------------------------------------',
+      'Traceback (most recent call last):',
+      '  File "tests/test_demo.py", line 6, in test_adds_two_numbers',
+      '    self.assertEqual(add(1, 2), 3)',
+      'AssertionError: 0 != 3',
+      '',
+      ...UNEXPECTED_SUCCESS.slice(2),
+      'FAILED (failures=1, unexpected successes=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.tests, 2);
+    assert.equal(result.evidence.pass, 1);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('an unexpected success alone fails the run without a failing test', () => {
+    const output = [
+      'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... ok',
+      ...UNEXPECTED_SUCCESS,
+      'FAILED (unexpected successes=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'nonzero_exit_without_test_failure');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.pass, 2);
+  });
+
+  test('subTest headers must still account exactly for the counted failures', () => {
+    const header = 'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=0)\nAssertionError: boom\n';
+    for (const [headers, failures, ran] of [[2, 1, 1], [1, 2, 1], [2, 2, 0]]) {
+      const output = `${header.repeat(headers)}\nRan ${ran} tests in 0.001s\n\nFAILED (failures=${failures})\n`;
+      const result = classifyRedEvidence({ ...INPUT, output });
+      assert.equal(result.reason, 'invalid_record', `${headers} headers, failures=${failures}, Ran ${ran}`);
+      assert.deepEqual(result.evidence.report_errors, ['Incomplete unittest report']);
+    }
+  });
+
+  test('subTest failures of an unrelated method still do not satisfy the target', () => {
+    const output = [
+      ...[0, 1].flatMap((i) => [
+        `FAIL: test_other (test_demo.AddTest.test_other) (i=${i})`,
+        '----------------------------------------------------------------------',
+        'AssertionError: boom',
+        '',
+      ]),
+      'Ran 2 tests in 0.001s',
+      '',
+      'FAILED (failures=2)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+    assert.equal(result.evidence.fail, 1);
+    assert.equal(result.evidence.pass, 1);
+  });
+
+  test('property: fail count and failing_tests always match the FAIL/ERROR headers actually present (#4970)', () => {
+    // Invariant (boundary containment + round-trip): for ANY report built
+    // from N distinct test names with exactly K of them given a FAIL: header
+    // (1 <= K <= N), parseUnittestSummary-derived evidence.tests === N,
+    // evidence.fail === K (never more, never fewer — no fabrication, no
+    // under-count), and failing_tests reproduces exactly the K names that
+    // were given headers, in order. The first failing name is always used as
+    // the target, so the run must always classify RED_EVIDENCE_OK.
+    const nameArb = fc
+      .string({ unit: fc.constantFrom(...'abcdefghijklmnopqrstuvwxyz'.split('')), minLength: 3, maxLength: 10 })
+      .map((s) => `test_${s}`);
+    const namesArb = fc.uniqueArray(nameArb, { minLength: 1, maxLength: 8 });
+
+    fc.assert(
+      fc.property(namesArb, fc.nat(), (names, seed) => {
+        const failingCount = 1 + (seed % names.length);
+        const failingNames = names.slice(0, failingCount);
+        const lines = [];
+        for (const name of failingNames) {
+          lines.push(`FAIL: ${name} (test_demo.AddTest.${name})`);
+          lines.push('----------------------------------------------------------------------');
+          lines.push('AssertionError: boom');
+          lines.push('');
+        }
+        lines.push(`Ran ${names.length} tests in 0.01s`);
+        lines.push('');
+        lines.push(`FAILED (failures=${failingCount})`);
+        lines.push('');
+        const output = lines.join('\n');
+
+        const result = classifyRedEvidence({
+          command: 'python -m unittest discover -s tests -v',
+          exitCode: 1,
+          targetTest: failingNames[0],
+          targetFile: 'tests/test_demo.py',
+          output,
+        });
+
+        return (
+          result.evidence.tests === names.length &&
+          result.evidence.fail === failingCount &&
+          result.evidence.fail <= result.evidence.tests &&
+          JSON.stringify(result.evidence.failing_tests) === JSON.stringify(failingNames) &&
+          result.verdict === 'RED_EVIDENCE_OK' &&
+          result.reason === 'target_test_failed'
+        );
+      }),
+      { numRuns: 200, seed: 20260927 },
+    );
+  });
+});
+
+// ─── #5106 — `go test` RED evidence ──────────────────────────────────────────
+// `go test` writes plain text, not TAP or XML, so a genuine failing Go test was
+// refused as zero_tests_discovered, and the most common wrong RED in Go — a test
+// naming a symbol that does not exist yet fails to COMPILE, it never asserts —
+// was indistinguishable from "no tests". Both need an answer of their own.
+
+describe('#5106 — go test RED evidence', () => {
+  const PKG = 'example.com/worker/internal/placement';
+  const INPUT = { command: 'go test ./...', exitCode: 1, targetTest: 'TestPlacement', targetFile: 'worker/internal/placement/placement_test.go' };
+
+  const RED = [
+    '--- FAIL: TestPlacement (0.00s)',
+    '    placement_test.go:14: got 2, want 1',
+    'FAIL',
+    `FAIL\t${PKG}\t0.004s`,
+    'FAIL',
+    '',
+  ].join('\n');
+
+  const BUILD_FAILED = [
+    `# ${PKG} [${PKG}.test]`,
+    'internal/placement/placement_test.go:9:12: undefined: Place',
+    `FAIL\t${PKG} [build failed]`,
+    'FAIL',
+    '',
+  ].join('\n');
+
+  test("the issue's literal repro (--- FAIL: TestX, exit 1, target TestX) is RED_EVIDENCE_OK", () => {
+    const result = classifyRedEvidence({ ...INPUT, output: RED });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK', JSON.stringify(result.evidence));
+    assert.equal(result.reason, 'target_test_failed');
+    assert.equal(result.evidence.format, 'go-test');
+    assert.deepEqual(result.evidence.failing_tests, ['TestPlacement']);
+  });
+
+  test('verbose output with passing siblings and a failing subtest still names the target', () => {
+    const output = [
+      '=== RUN   TestOther', '--- PASS: TestOther (0.00s)',
+      '=== RUN   TestPlacement', '=== RUN   TestPlacement/edge',
+      '    placement_test.go:20: edge case wrong',
+      '    --- FAIL: TestPlacement/edge (0.00s)',
+      '--- FAIL: TestPlacement (0.00s)',
+      'FAIL', `FAIL\t${PKG}\t0.004s`, 'FAIL', '',
+    ].join('\n');
+    assert.equal(classifyRedEvidence({ ...INPUT, output }).verdict, 'RED_EVIDENCE_OK');
+    assert.equal(classifyRedEvidence({ ...INPUT, output, targetTest: 'TestPlacement/edge' }).verdict, 'RED_EVIDENCE_OK');
+  });
+
+  test('output that STARTS with an ok package line is Go output, not TAP', () => {
+    const output = `ok  \texample.com/worker/other\t0.002s\n${RED}`;
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.evidence.format, 'go-test');
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+  });
+
+  test('a compile failure is refused with its own reason, not accepted and not "zero tests"', () => {
+    const result = classifyRedEvidence({ ...INPUT, output: BUILD_FAILED });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'build_failure');
+  });
+
+  test('a build failure anywhere in the run is refused even when another package genuinely failed', () => {
+    const result = classifyRedEvidence({ ...INPUT, output: `${RED}${BUILD_FAILED}` });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'build_failure');
+  });
+
+  test('a package that could not be set up is refused the same way', () => {
+    const output = `FAIL\t${PKG} [setup failed]\nFAIL\n`;
+    assert.equal(classifyRedEvidence({ ...INPUT, output }).reason, 'build_failure');
+  });
+
+  test('exit 0, an unrelated failure and a run with no test results keep their existing refusals', () => {
+    assert.equal(classifyRedEvidence({ ...INPUT, exitCode: 0, output: `ok  \t${PKG}\t0.003s\n` }).reason, 'unexpected_green');
+    assert.equal(classifyRedEvidence({ ...INPUT, output: RED.replace('TestPlacement', 'TestUnrelated') }).reason, 'no_target_test_failure');
+    const panicOnly = `panic: init failed\n\ngoroutine 1 [running]:\nFAIL\t${PKG}\t0.010s\nFAIL\n`;
+    assert.equal(classifyRedEvidence({ ...INPUT, output: panicOnly }).reason, 'zero_tests_discovered');
+  });
+
+  test('a failure with no package summary is a truncated record, not evidence', () => {
+    const result = classifyRedEvidence({ ...INPUT, output: '--- FAIL: TestPlacement (0.00s)\n' });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+  });
+
+  test('the same test name failing in two packages is ambiguous until qualified by package', () => {
+    const output = [
+      '--- FAIL: TestPlacement (0.00s)', 'FAIL', 'FAIL\texample.com/a\t0.001s',
+      '--- FAIL: TestPlacement (0.00s)', 'FAIL', 'FAIL\texample.com/b\t0.001s', 'FAIL', '',
+    ].join('\n');
+    assert.equal(classifyRedEvidence({ ...INPUT, output }).reason, 'no_target_test_failure');
+    const qualified = classifyRedEvidence({ ...INPUT, output, targetTest: 'example.com/a.TestPlacement' });
+    assert.equal(qualified.verdict, 'RED_EVIDENCE_OK');
+  });
+});
+
+// ── #5721 — a vitest load-failure JUnit entry never satisfies a RED target ────
+// vitest's JUnit reporter emits one <testcase classname="bad.test.js" name="bad.test.js">
+// with a <failure> for a test FILE that crashed at load. That entry asserted nothing.
+
+describe('#5721 — vitest load-failure JUnit entry is never a RED target', () => {
+  const VITEST_EVIDENCE = {"command":"vitest 4.1.7 run --globals --reporter=junit (scratch hash.test.js, bad.test.js)","exitCode":1,"output":"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<testsuites name=\"vitest tests\" tests=\"3\" failures=\"2\" errors=\"0\" time=\"0.020839859\">\n    <testsuite name=\"bad.test.js\" timestamp=\"2026-10-24T11:57:58.844Z\" hostname=\"fixture-host\" tests=\"1\" failures=\"1\" errors=\"0\" skipped=\"0\" time=\"0\">\n        <testcase classname=\"bad.test.js\" name=\"bad.test.js\" time=\"0\">\n            <failure message=\"load crash\" type=\"Error\">\nError: load crash\n ❯ bad.test.js:1:7\n            </failure>\n        </testcase>\n    </testsuite>\n    <testsuite name=\"hash.test.js\" timestamp=\"2026-10-24T11:57:58.854Z\" hostname=\"fixture-host\" tests=\"2\" failures=\"1\" errors=\"0\" skipped=\"0\" time=\"0.020839859\">\n        <testcase classname=\"hash.test.js\" name=\"suite one &gt; issue #42 case\" time=\"0.012710944\">\n            <failure message=\"expected 1 to be 2 // Object.is equality\" type=\"AssertionError\">\nAssertionError: expected 1 to be 2 // Object.is equality\n\n- Expected\n+ Received\n\n- 2\n+ 1\n\n ❯ hash.test.js:3:15\n            </failure>\n        </testcase>\n        <testcase classname=\"hash.test.js\" name=\"suite one &gt; a passing case\" time=\"0.00074436\">\n        </testcase>\n    </testsuite>\n</testsuites>\n","targetTest":"bad.test.js"};
+
+  const classify = (targetTest, extra = {}) => classifyRedEvidence({ ...VITEST_EVIDENCE, targetTest, ...extra });
+
+  test('AC1: the crashing file as target is INVALID_RED with the load-failure reason', () => {
+    const result = classify('bad.test.js');
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'fixture_or_load_failure');
+    assert.equal(result.evidence.matched_test, null);
+  });
+
+  test('AC1: the qualified load-failure identity as target is INVALID_RED too', () => {
+    const result = classify('bad.test.js#bad.test.js');
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.evidence.matched_test, null);
+  });
+
+  test('AC2: the real failing test as target is still RED_EVIDENCE_OK', () => {
+    const result = classify('suite one > issue #42 case');
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.equal(result.evidence.matched_test, 'hash.test.js#suite one > issue #42 case');
+  });
+
+  test('AC3 (#4701): classname-qualified target and a name containing # still match', () => {
+    for (const target of ['hash.test.js#suite one > issue #42 case', 'suite one > issue #42 case']) {
+      const result = classify(target);
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK', target);
+      assert.equal(result.evidence.matched_test, 'hash.test.js#suite one > issue #42 case', target);
+    }
+  });
+
+  test('control: a passing test as target is not the failure', () => {
+    const result = classify('suite one > a passing case');
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+  });
+
+  test('parser marks only the load-failure case', () => {
+    const report = parseTestReport(VITEST_EVIDENCE.output);
+    assert.deepEqual(report.tests.map((t) => t.loadFailure === true), [true, false, false]);
+  });
+
+  test('control: a file-like name under a different classname is a real test', () => {
+    const output = '<testsuite tests="1"><testcase classname="suite" name="bad.test.js"><failure/></testcase></testsuite>';
+    const result = classifyRedEvidence({ command: 'x', exitCode: 1, output, targetTest: 'bad.test.js' });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+  });
+
+  test('control (#4724): a Surefire class-level entry with name == classname keeps matching the class target', () => {
+    const output = '<testsuite tests="1"><testcase classname="com.example.AppTest" name="com.example.AppTest"><error/></testcase></testsuite>';
+    const result = classifyRedEvidence({ command: 'mvn test', exitCode: 1, output, targetTest: 'AppTest' });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+  });
+
+  test('control (#4724): Surefire FQNs ending in a language-like segment stay class targets', () => {
+    for (const fqn of ['com.acme.go', 'com.acme.rs', 'com.acme.py', 'com.example.Spec']) {
+      const output = `<testsuite tests="1"><testcase classname="${fqn}" name="${fqn}"><error/></testcase></testsuite>`;
+      for (const targetTest of [fqn, fqn.split('.').at(-1)]) {
+        const result = classifyRedEvidence({ command: 'mvn test', exitCode: 1, output, targetTest });
+        assert.equal(result.verdict, 'RED_EVIDENCE_OK', `${fqn} / ${targetTest}`);
+        assert.equal(parseTestReport(output).tests[0].loadFailure, undefined, fqn);
+      }
+    }
+  });
+
+  const caseXml = (attrs) => `<testsuite tests="1"><testcase ${attrs}><failure/></testcase></testsuite>`;
+  const flagged = (attrs) => parseTestReport(caseXml(attrs)).tests[0].loadFailure === true;
+
+  test('boundary: name one character off the classname is a real test, not a load failure', () => {
+    assert.equal(flagged('classname="bad.test.js" name="bad.test.js"'), true);
+    assert.equal(flagged('classname="bad.test.js" name="bad.test.jsx"'), false);
+    assert.equal(flagged('classname="bad.test.jsx" name="bad.test.js"'), false);
+    assert.equal(flagged('classname="bad.test.js" name="bad.test.j"'), false);
+  });
+
+  test('boundary: equal names with a wrong extension are not load failures, a Windows path is', () => {
+    for (const file of ['bad.test.j', 'bad.testjs', 'bad.js.snap', 'bad.test.jsxx']) {
+      assert.equal(parseTestReport(caseXml(`classname="${file}" name="${file}"`)).tests[0].loadFailure, undefined, file);
+    }
+    assert.equal(flagged('classname="src\\a\\bad.test.ts" name="src\\a\\bad.test.ts"'), true);
+  });
+
+  test('a nested path and every JS/TS extension family member are flagged', () => {
+    for (const file of ['src/a/bad.test.ts', 'bad.test.mts', 'bad.test.cts', 'bad.test.tsx', 'bad.test.mjs', 'bad.test.cjs', 'bad.test.jsx']) {
+      assert.equal(flagged(`classname="${file}" name="${file}"`), true, file);
+    }
+  });
+
+  test('attribute order does not matter: name before classname is still flagged', () => {
+    assert.equal(flagged('name="bad.test.js" classname="bad.test.js"'), true);
+    const output = caseXml('name="bad.test.js" classname="bad.test.js"');
+    assert.equal(classifyRedEvidence({ command: 'x', exitCode: 1, output, targetTest: 'bad.test.js' }).reason, 'fixture_or_load_failure');
+  });
+
+  // jest-junit (utils/buildJsonResults.js): a suite with no results gets classNameTemplate
+  // `Test suite failed to run`, titleTemplate `{filepath}`, and an <error> child.
+  describe('jest-junit suite that failed to run', () => {
+    const JEST_OUTPUT = '<testsuites name="jest tests" tests="3" failures="1" errors="1">'
+      + '<testsuite name="src/bad.test.js" errors="1" failures="0" skipped="0" tests="1">'
+      + '<testcase classname="Test suite failed to run" name="src/bad.test.js" time="0"><error>Cannot find module</error></testcase></testsuite>'
+      + '<testsuite name="real" errors="0" failures="1" skipped="0" tests="2">'
+      + '<testcase classname="real real fails" name="real real fails" time="0.1"><failure>expected 1 to be 2</failure></testcase>'
+      + '<testcase classname="real passes" name="real passes" time="0.1"></testcase></testsuite></testsuites>';
+    const jest = (targetTest) => classifyRedEvidence({ command: 'jest --ci', exitCode: 1, output: JEST_OUTPUT, targetTest });
+
+    test('the suite-load entry is flagged and the real tests are not', () => {
+      assert.deepEqual(parseTestReport(JEST_OUTPUT).tests.map((t) => t.loadFailure === true), [true, false, false]);
+    });
+
+    test('targeting the fixed class name or the file path is INVALID_RED (fixture_or_load_failure)', () => {
+      for (const target of ['Test suite failed to run', 'src/bad.test.js', 'Test suite failed to run#src/bad.test.js']) {
+        const result = jest(target);
+        assert.equal(result.verdict, 'INVALID_RED', target);
+        assert.equal(result.reason, 'fixture_or_load_failure', target);
+        assert.equal(result.evidence.matched_test, null, target);
+      }
+    });
+
+    test('the real failing test is still RED_EVIDENCE_OK', () => {
+      assert.equal(jest('real real fails').verdict, 'RED_EVIDENCE_OK');
+    });
+
+    test('the jest-junit testExecError hook-failure entry (name === classname, not a file) is not a load failure', () => {
+      const title = "Test execution failure: could be caused by test hooks like 'afterAll'.";
+      const output = `<testsuite tests="1"><testcase classname="${title}" name="${title}" time="0"><failure>hook crashed</failure></testcase></testsuite>`;
+      assert.equal(parseTestReport(output).tests[0].loadFailure, undefined);
+    });
+  });
+
+  // node:test TAP (nodejs/node#64203): a test file that exits non-zero without a failing subtest
+  // is reported as `not ok N - <file>` with `error: 'test failed'`, `code: 'ERR_TEST_FAILURE'`.
+  describe('node:test TAP file-level failure', () => {
+    const tapFor = (error, code) => ['TAP version 13', 'not ok 1 - crash.test.cjs', '  ---', "  type: 'test'",
+      "  failureType: 'testCodeFailure'", `  error: '${error}'`, `  code: '${code}'`, '  ...', '1..1', '# tests 1', '# fail 1', ''].join('\n');
+
+    test('targeting the crashing file by name alone (no targetFile) is INVALID_RED', () => {
+      const result = classifyRedEvidence({ command: 'node --test', exitCode: 1, output: tapFor('test failed', 'ERR_TEST_FAILURE'), targetTest: 'crash.test.cjs' });
+      assert.equal(result.verdict, 'INVALID_RED');
+      assert.equal(result.reason, 'fixture_or_load_failure');
+    });
+
+    test('AC2: the file-level entry beside a real failing subtest: subtest target is RED, file target is INVALID_RED', () => {
+      const output = ['TAP version 13', 'not ok 1 - real subtest', '  ---', "  error: 'expected 1 to equal 2'", "  code: 'ERR_ASSERTION'", '  ...',
+        'not ok 2 - crash.test.cjs', '  ---', "  type: 'test'", "  failureType: 'testCodeFailure'", "  error: 'test failed'", "  code: 'ERR_TEST_FAILURE'", '  ...',
+        '1..2', '# tests 2', '# fail 2', ''].join('\n');
+      const run = (targetTest) => classifyRedEvidence({ command: 'node --test', exitCode: 1, output, targetTest });
+      assert.equal(run('real subtest').verdict, 'RED_EVIDENCE_OK');
+      const file = run('crash.test.cjs');
+      assert.equal(file.verdict, 'INVALID_RED');
+      assert.equal(file.reason, 'fixture_or_load_failure');
+    });
+
+    test('control: a file-looking test name that fails a real assertion stays a valid target', () => {
+      const result = classifyRedEvidence({ command: 'node --test', exitCode: 1, output: tapFor('expected 1 to equal 2', 'ERR_ASSERTION'), targetTest: 'crash.test.cjs' });
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    });
+  });
+
+  // go test reports a package that fails to compile or set up as one package summary line
+  // ([build failed] / [setup failed]); cmd/test2json: "Events for the overall package test do not
+  // set Test". It never yields a per-test entry named after the package or file.
+  test('go test build failure yields no per-test entry that could match a target', () => {
+    const output = '# example.com/p\np_test.go:3:1: undefined: Foo\nFAIL\texample.com/p [build failed]\nFAIL\n';
+    const report = parseTestReport(output);
+    assert.equal(report.buildFailed, true);
+    assert.deepEqual(report.tests, []);
+    for (const targetTest of ['example.com/p', 'p_test.go', 'TestFoo']) {
+      const result = classifyRedEvidence({ command: 'go test ./...', exitCode: 1, output, targetTest });
+      assert.equal(result.verdict, 'INVALID_RED', targetTest);
+      assert.equal(result.reason, 'build_failure', targetTest);
+    }
+  });
+});
+
+// ── #5721 AC1 through the gate (evaluateTddRedEvidence) ───────────────────────
+
+describe('#5721 — gate-level: the crashing file as target blocks, the real failing test passes', () => {
+  const gate = require('../gsd-core/bin/lib/gate-tdd-red-evidence.cjs');
+  const { createTempProject } = require('./helpers.cjs');
+  const output = '<testsuites><testsuite tests="1"><testcase classname="bad.test.js" name="bad.test.js"><failure message="load crash"/></testcase></testsuite>'
+    + '<testsuite tests="2"><testcase classname="hash.test.js" name="suite one &gt; issue #42 case"><failure/></testcase>'
+    + '<testcase classname="hash.test.js" name="suite one &gt; a passing case"></testcase></testsuite></testsuites>';
+  const evaluate = (targetTest) => {
+    const dir = createTempProject('gate-5721-');
+    try {
+      fs.writeFileSync(path.join(dir, 'red.json'), JSON.stringify({ command: 'vitest run --reporter=junit', exitCode: 1, output, targetTest }));
+      return gate.evaluateTddRedEvidence({ projectDir: dir, args: [path.join(dir, 'red.json')] });
+    } finally {
+      cleanup(dir);
+    }
+  };
+
+  test('AC1: target = crashing file -> block, INVALID_RED / fixture_or_load_failure', () => {
+    const result = evaluate('bad.test.js');
+    assert.equal(result.outcome, 'block');
+    assert.equal(result.block, true);
+    assert.equal(result.payload.verdict, 'INVALID_RED');
+    assert.equal(result.payload.reason, 'fixture_or_load_failure');
+  });
+
+  test('AC2: target = real failing test -> pass, RED_EVIDENCE_OK', () => {
+    const result = evaluate('suite one > issue #42 case');
+    assert.equal(result.outcome, 'pass');
+    assert.equal(result.block, false);
+    assert.equal(result.payload.verdict, 'RED_EVIDENCE_OK');
+  });
+});
+
+// ─── #5819 — node:test assert.throws/rejects RED repeats diagnostic keys ──────
+// node:test emits `error` and `stack` twice in a failing assert.throws(fn, /re/)
+// diagnostic block. Strict YAML rejects the duplicates, the whole block came
+// back as non-TAP data, and a genuine RED was refused as invalid_record.
+// Real captures of all three shapes live in tests/fixtures/tdd-red-evidence/;
+// the fixtures below restate the shape with neutral paths for the matrix.
+const INTERRUPTION = 'Test run interrupted by cancellation, hook failure, or timeout';
+
+const dupDiagTAP = (diagLines, points = ['not ok 1 - rejects a malformed token'], plan = '1..1') => [
+  'TAP version 13',
+  ...points.flatMap((point) => [`# Subtest: ${point.replace(/^(?:not )?ok \d+ - /, '')}`, point]),
+  '  ---',
+  ...diagLines,
+  '  ...',
+  plan,
+  `# tests ${points.length}`,
+  '# suites 0',
+  `# pass ${points.filter((p) => p.startsWith('ok ')).length}`,
+  `# fail ${points.filter((p) => p.startsWith('not ok')).length}`,
+  '# cancelled 0', '# skipped 0', '# todo 0', '# duration_ms 84.6',
+  '',
+].join('\n');
+
+const THROWS_REGEXP_DIAG = [
+  "  duration_ms: 1.7641",
+  "  type: 'test'",
+  "  location: 'throws-red.test.cjs:8:1'",
+  "  failureType: 'testCodeFailure'",
+  '  error: |-',
+  '    The input did not match the regular expression /rejected token/. Input:',
+  '    ',
+  "    'Error: boom: token accepted'",
+  '    ',
+  "  code: 'ERR_ASSERTION'",
+  "  name: 'AssertionError'",
+  '  expected:',
+  '  actual:',
+  "  error: 'boom: token accepted'",
+  '  stack: |-',
+  '    throws-red.test.cjs:9:31',
+  "  operator: 'throws'",
+  '  stack: |-',
+  '    throws-red.test.cjs:9:10',
+];
+
+describe('#5819 — node:test RED with repeated diagnostic keys', () => {
+  test('a real assert.throws(fn, /re/) RED is accepted despite repeated error/stack keys', () => {
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(THROWS_REGEXP_DIAG),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.equal(result.evidence.matched_test, 'rejects a malformed token');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('a repeated-key block carrying no failureType at all recovers the same way', () => {
+    // node:test always writes failureType, but recovery must not depend on it:
+    // the decoded-write list simply contains no failureType entry to count.
+    const noFailureType = THROWS_REGEXP_DIAG.filter((line) => !line.startsWith('  failureType'));
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(noFailureType),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.report_errors, []);
+  });
+
+  test('a single-key diagnostic control (assert.equal shape) stays accepted', () => {
+    // The same failure intent without repeated keys — node:test's shape for
+    // assert.equal — parsed fine before #5819 and must keep doing so.
+    const singleKey = [
+      '  duration_ms: 0.923',
+      "  type: 'test'",
+      "  location: 'control-equal.test.cjs:6:1'",
+      "  failureType: 'testCodeFailure'",
+      '  error: |-',
+      '    Expected values to be strictly equal:',
+      '    ',
+      '    1 !== 2',
+      '    ',
+      "  code: 'ERR_ASSERTION'",
+      "  name: 'AssertionError'",
+      '  expected: 2',
+      '  actual: 1',
+      "  operator: 'strictEqual'",
+      '  stack: |-',
+      '    control-equal.test.cjs:7:10',
+    ];
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(singleKey),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.report_errors, []);
+  });
+
+  test('a recovered block still refuses interruptions: timeout, cancellation, hook failure', () => {
+    for (const failureType of ['testTimeoutFailure', 'cancelledByParent', 'hookFailed']) {
+      const diag = THROWS_REGEXP_DIAG.map((line) =>
+        line === "  failureType: 'testCodeFailure'" ? `  failureType: '${failureType}'` : line);
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP(diag),
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'INVALID_RED', failureType);
+      assert.equal(result.reason, 'invalid_record', failureType);
+      assert.deepEqual(result.evidence.report_errors, [INTERRUPTION], failureType);
+    }
+  });
+
+  test('a single-key interruption diagnostic keeps its existing refusal (no recovery involved)', () => {
+    const diag = [
+      "  failureType: 'testTimeoutFailure'",
+      "  error: 'timed out after 500ms'",
+    ];
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(diag),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.deepEqual(result.evidence.report_errors, [INTERRUPTION]);
+  });
+
+  test('a repeated failureType key is ambiguous and stays refused, never recovered', () => {
+    const diag = THROWS_REGEXP_DIAG.flatMap((line) =>
+      line === "  failureType: 'testCodeFailure'"
+        ? [line, "  failureType: 'testCodeFailure'"]
+        : [line]);
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(diag),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.deepEqual(result.evidence.report_errors, ['Non-TAP data in report', 'Malformed TAP']);
+  });
+
+  test('a repeated failureType key in quoted or single-line flow form is equally refused', () => {
+    // Review finding on the old fixture: the flow row appended block keys after the
+    // flow mapping, which is a YAML syntax error, so the row passed by failing the
+    // tolerant parse before the ambiguity check ever ran. The flow mapping is now the
+    // WHOLE body: a flow-mapping body has no block key lines to enumerate, so recovery
+    // refuses it structurally rather than guessing at its key set.
+    for (const diag of [
+      ["  'failureType': 'testTimeoutFailure'", "  'failureType': 'testCodeFailure'"],
+      ['  {failureType: \'testTimeoutFailure\', error: \'a\', error: \'b\', failureType: \'testCodeFailure\'}'],
+    ]) {
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP(diag),
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'INVALID_RED', JSON.stringify(diag));
+      assert.ok(result.evidence.report_errors.includes('Malformed TAP'), JSON.stringify(diag));
+    }
+    // A flow body whose only duplicates are error/stack is refused the same way —
+    // fail-closed for a shape whose keys cannot be enumerated block-wise, never a
+    // partial recovery.
+    const flowOnly = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(["  {failureType: 'testCodeFailure', error: 'a', error: 'b'}"]),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(flowOnly.verdict, 'INVALID_RED');
+    assert.ok(flowOnly.evidence.report_errors.includes('Malformed TAP'));
+    // Independent-review finding on the parse-derived count: a flow body whose ONLY
+    // duplicate is failureType collapses to ONE distinct key under last-key-wins, so
+    // a single-segment count of distinct keys reads it as one write and would recover,
+    // masking the interrupting value. The strict per-segment parse must catch it.
+    for (const diag of [
+      ["  {failureType: 'testTimeoutFailure', failureType: 'testCodeFailure'}"],
+      ["  {failureType: 'testTimeoutFailure',", "    failureType: 'testCodeFailure'}"],
+      ['  {"failureType": \'testTimeoutFailure\', "' + String.fromCharCode(92) + 'U00000066ailureType": \'testCodeFailure\'}'],
+    ]) {
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP(diag),
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'INVALID_RED', JSON.stringify(diag));
+      assert.ok(result.evidence.report_errors.includes('Malformed TAP'), JSON.stringify(diag));
+    }
+  });
+
+  test('a repeated failureType cannot be hidden behind any YAML key spelling (review finding)', () => {
+    // The ambiguity rule is decided by the YAML parser's decoded writes, not by a
+    // text scan: every spelling js-yaml resolves to failureType counts. The escape and
+    // explicit-key rows are spellings the original text count demonstrably missed; the
+    // escaped-line-break row is defense in depth — js-yaml refuses a line-broken
+    // implicit key in the whole-body tolerant parse, and the segment parse refuses
+    // it again if it is ever spelled as an explicit key.
+    const BS = String.fromCharCode(92);
+    for (const diag of [
+      // 8-hex \U escape: js-yaml decodes \U00000066 to 'f'.
+      ['  "failureType": \'testTimeoutFailure\'', '  "' + BS + 'U00000066ailureType": \'testCodeFailure\''],
+      // Explicit key with a trailing comment: '? failureType # c' then ': value'.
+      ["  failureType: 'testTimeoutFailure'", '  ? failureType # c', "  : 'testCodeFailure'"],
+      // Double-quoted key split by an escaped line break (continuation deeper-indented).
+      ['  "failureType": \'testTimeoutFailure\'', '  "failure' + BS, '    Type": \'testCodeFailure\''],
+      // 4-hex \u escape (the decoded-count must cover it alongside \U).
+      ['  "failureType": \'testTimeoutFailure\'', '  "' + BS + 'u0066ailureType": \'testCodeFailure\''],
+    ]) {
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP([...diag, "  error: 'first'", "  error: 'second'"]),
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'INVALID_RED', JSON.stringify(diag));
+      assert.ok(result.evidence.report_errors.includes('Malformed TAP'), JSON.stringify(diag));
+    }
+  });
+
+  test('failureType-looking text inside a diagnostic VALUE is not a key (review finding)', () => {
+    // A genuine RED whose assertion message mentions "failureType:" inside the error
+    // block scalar must still recover: the key set is the parser-decoded mapping keys,
+    // not every occurrence of the token in the body.
+    const diag = [
+      "  failureType: 'testCodeFailure'",
+      '  error: |-',
+      '    expected a failureType: testTimeoutFailure error, got none',
+      "  stack: 'frame one'",
+      "  stack: 'frame two'",
+    ];
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(diag),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.report_errors, []);
+  });
+
+  test('a single escape-spelled failureType key recovers like the plain form', () => {
+    // One decoded failureType write, however spelled, does not make the signal
+    // ambiguous, and the decoded value reaches the interruption check through
+    // the per-write judgment like any other value.
+    const diag = [
+      '  "' + String.fromCharCode(92) + 'x66ailureType": \'testCodeFailure\'',
+      "  error: 'first'",
+      "  error: 'second'",
+    ];
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(diag),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.report_errors, []);
+    const interrupted = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP([
+        '  "' + String.fromCharCode(92) + 'x66ailureType": \'testTimeoutFailure\'',
+        "  error: 'first'",
+        "  error: 'second'",
+      ]),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(interrupted.verdict, 'INVALID_RED');
+    assert.deepEqual(interrupted.evidence.report_errors, ['Test run interrupted by cancellation, hook failure, or timeout']);
+  });
+
+  test('a diagnostic block carrying anchors or aliases is refused, never recovered', () => {
+    for (const diag of [
+      ["  failureType: &interrupted 'testTimeoutFailure'", "  saved: *interrupted", "  error: 'a'", "  error: 'b'"],
+      ["  payload: &x ['a']", "  other: *x", "  error: 'a'", "  error: 'b'"],
+    ]) {
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP(diag),
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'INVALID_RED', JSON.stringify(diag));
+      assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'), JSON.stringify(diag));
+    }
+  });
+
+  test('a repeated-key block with an unreferenced YAML anchor stays refused', () => {
+    // This anchor has no alias, so resolving a reference in another segment cannot cause the refusal.
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(['  info: &context details', "  error: 'first'", "  error: 'second'"]),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'));
+  });
+
+  test('a recovered block still re-applies #5721 file-level load-failure refusal (merge review)', () => {
+    // Emergent combination gap found by the independent review of the #5721 merge:
+    // upstream flags `not ok N - <file>` with error 'test failed' + ERR_TEST_FAILURE
+    // (asserted nothing) from the PARSED diagnostic; a block whose only defect is
+    // repeated keys goes through this PR's recovery path, where that parsed channel
+    // is absent. The recovery must refuse a block whose recovered map carries the
+    // same signature instead of letting the file-named entry prove RED.
+    const loadFailureDup = [
+      '  duration_ms: 28.3',
+      "  type: 'test'",
+      "  location: 'crash.test.cjs:1:1'",
+      "  failureType: 'testCodeFailure'",
+      '  exitCode: 1',
+      "  error: 'test failed'",
+      "  code: 'ERR_TEST_FAILURE'",
+      "  error: 'test failed'",
+      "  stack: 'frame one'",
+      "  stack: 'frame two'",
+    ];
+    const output = [
+      'TAP version 13',
+      '# Subtest: crash.test.cjs',
+      'not ok 1 - crash.test.cjs',
+      '  ---',
+      ...loadFailureDup,
+      '  ...',
+      '1..1',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({
+      command: 'node --test crash.test.cjs', exitCode: 1, output,
+      targetTest: 'crash.test.cjs',
+    });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'),
+      JSON.stringify(result.evidence.report_errors));
+    // Re-review finding: judging the signature on the last-wins merge is bypassed by
+    // writing the signature first and a later benign value last — the very repeated
+    // shape this recovery exists for. Every write counts, in any order.
+    const maskedSignature = [
+      '  duration_ms: 28.3',
+      "  failureType: 'testCodeFailure'",
+      "  error: 'test failed'",
+      "  code: 'ERR_TEST_FAILURE'",
+      "  error: 'x'",
+      "  stack: 'frame one'",
+      "  stack: 'frame two'",
+    ].join('\n');
+    const masked = classifyRedEvidence({
+      command: 'node --test crash.test.cjs', exitCode: 1,
+      output: output.replace(loadFailureDup.join('\n'), maskedSignature),
+      targetTest: 'crash.test.cjs',
+    });
+    assert.equal(masked.verdict, 'INVALID_RED');
+    assert.ok(masked.evidence.report_errors.includes('Non-TAP data in report'),
+      JSON.stringify(masked.evidence.report_errors));
+    // Third review finding: the repeated-code arm (sawLoadFailureCode) is untested —
+    // the signature code followed by a benign code write must refuse in the same way.
+    const maskedCode = classifyRedEvidence({
+      command: 'node --test crash.test.cjs', exitCode: 1,
+      output: output.replace(loadFailureDup.join('\n'), [
+        '  duration_ms: 28.3',
+        "  failureType: 'testCodeFailure'",
+        "  error: 'test failed'",
+        "  code: 'ERR_TEST_FAILURE'",
+        "  code: 'OTHER_CODE'",
+        "  stack: 'frame one'",
+        "  stack: 'frame two'",
+      ].join('\n')),
+      targetTest: 'crash.test.cjs',
+    });
+    assert.equal(maskedCode.verdict, 'INVALID_RED');
+    assert.ok(maskedCode.evidence.report_errors.includes('Non-TAP data in report'),
+      JSON.stringify(maskedCode.evidence.report_errors));
+    // Control: a repeated error whose writes are BOTH ordinary values still recovers.
+    const ordinaryDup = classifyRedEvidence({
+      command: 'node --test crash.test.cjs', exitCode: 1,
+      output: output.replace(loadFailureDup.join('\n'), [
+        "  failureType: 'testCodeFailure'",
+        "  error: 'first failure'",
+        "  error: 'second failure'",
+        "  stack: 'frame one'",
+        "  stack: 'frame two'",
+      ].join('\n')),
+      targetTest: 'crash.test.cjs',
+    });
+    assert.equal(ordinaryDup.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(ordinaryDup.evidence.report_errors, []);
+  });
+
+  for (const [description, ...diagnostic] of [
+    ['the error signature written last', "  error: 'other'", "  code: 'ERR_TEST_FAILURE'", "  error: 'test failed'"],
+    ['the code signature written last', "  code: 'OTHER_CODE'", "  error: 'test failed'", "  code: 'ERR_TEST_FAILURE'"],
+    ['a literal scalar signature', '  error: |-', '    test failed', "  code: 'ERR_TEST_FAILURE'", "  error: 'other'"],
+    ['a folded scalar signature', '  error: >-', '    test', '    failed', "  code: 'ERR_TEST_FAILURE'", "  error: 'other'"],
+    ['an inline comment on the signature write', "  error: 'test failed' # context", "  code: 'ERR_TEST_FAILURE'", "  error: 'other'"],
+    ['a separate explicit key and value', '  ? error', "  : 'first'", "  error: 'second'"],
+  ]) {
+    test(`a repeated-key block with ${description} stays refused`, () => {
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP([...diagnostic, "  failureType: 'testCodeFailure'"], ['not ok 1 - crash.test.cjs']),
+        targetTest: 'crash.test.cjs',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'INVALID_RED');
+      assert.equal(result.reason, 'invalid_record');
+      assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'));
+    });
+  }
+
+  for (const { signal, error, code } of [
+    { signal: 'error', error: 'test failed', code: 'ERR_ASSERTION' },
+    { signal: 'code', error: 'expected a malformed token to be rejected', code: 'ERR_TEST_FAILURE' },
+  ]) {
+    test(`a repeated-key block with only the load-failure ${signal} still recovers`, () => {
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP([
+          "  failureType: 'testCodeFailure'",
+          `  error: '${error}'`,
+          `  code: '${code}'`,
+          "  stack: 'frame one'",
+          "  stack: 'frame two'",
+        ]),
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+      assert.equal(result.reason, 'target_test_failed');
+      assert.deepEqual(result.evidence.report_errors, []);
+    });
+  }
+
+  for (const [description, ...diagnostic] of [
+    ['a load-failure message under a different key', "  message: 'test failed'", "  code: 'ERR_TEST_FAILURE'"],
+    ['a load-failure code under a different key', "  error: 'test failed'", "  note: 'ERR_TEST_FAILURE'"],
+    ['a load-failure message prefix', "  error: 'test failed unexpectedly'", "  code: 'ERR_TEST_FAILURE'"],
+    ['a trailing space in the load-failure message', "  error: 'test failed '", "  code: 'ERR_TEST_FAILURE'"],
+    ['a load-failure code prefix', "  error: 'test failed'", "  code: 'ERR_TEST_FAILURE_X'"],
+    ['a hash character in a quoted error', "  code: 'ERR_TEST_FAILURE'", "  error: 'test failed # details'"],
+    ['a hash line in a literal scalar', '  error: |-', '    test failed', '    # context', "  code: 'ERR_TEST_FAILURE'"],
+  ]) {
+    test(`a repeated-key block with ${description} still recovers`, () => {
+      const result = classifyRedEvidence(validRedInput({
+        output: dupDiagTAP([...diagnostic, "  stack: 'frame one'", "  stack: 'frame two'"]),
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+      assert.equal(result.reason, 'target_test_failed');
+      assert.deepEqual(result.evidence.report_errors, []);
+    });
+  }
+
+  test('a repeated-key block with a comment at the key indentation still recovers', () => {
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP([
+        "  failureType: 'testCodeFailure'",
+        "  error: 'expected a malformed token to be rejected'",
+        "  stack: 'frame one'",
+        '  # additional stack context',
+        "  stack: 'frame two'",
+      ]),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+  });
+
+  test('a repeated-key block with a leading comment before the first key still recovers', () => {
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(['  ', '  # diagnostic context', "  error: 'first'", "  error: 'second'"]),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+  });
+
+  test('TAP diagnostics and Go test logs can quote output from the other reporter', () => {
+    const tap = '\n' + dupDiagTAP(['  stack: |-', '    --- FAIL: TestGhost (0.123s)', "  stack: 'another frame'"]);
+    const tapReport = parseTestReport(tap);
+    assert.equal(tapReport.format, 'tap');
+    assert.equal(tapReport.valid, true);
+    assert.deepEqual(tapReport.issues, []);
+    assert.deepEqual(tapReport.tests, [{
+      name: 'rejects a malformed token', identities: ['rejects a malformed token'],
+      group: null, groupIdentities: [], status: 'failed',
+    }]);
+
+    const go = [
+      'stdout: TAP version 13',
+      '--- FAIL: TestGo (0.12s)',
+      '    --- SKIP: TestGo/skipped (0s)',
+      '    --- PASS: TestGo/precondition (0.00s)',
+      '--- FAIL: TestGo (0.12s)',
+      'FAIL\texample.com/pkg\t0.120s', '',
+    ].join('\n');
+    const goReport = parseTestReport(go);
+    assert.equal(goReport.format, 'go-test');
+    assert.equal(goReport.valid, true);
+    assert.deepEqual(goReport.tests.map(({ name, groupIdentities, status }) => [name, groupIdentities, status]), [
+      ['TestGo', [], 'failed'], ['TestGo/skipped', [], 'skipped'], ['TestGo/precondition', [], 'passed'],
+    ]);
+  });
+
+  // The lone-CR refusal (re-review Minor 1) is removed with its guard: tap-parser's
+  // line splitter (`/^.*\r?\n/`) stops `.*` before a mid-line \r, so the line never
+  // matches and stays buffered — the block cannot reach recoverDuplicateKeyDiagnostic
+  // from its only caller, making the guard unreachable dead code.
+
+  test('repeated keys alongside another YAML error stay refused', () => {
+    const diag = [...THROWS_REGEXP_DIAG, '  code: [unclosed'];
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(diag),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.ok(result.evidence.report_errors.includes('Malformed TAP'));
+  });
+
+  test('malformed YAML without repeated keys stays refused', () => {
+    const diag = [
+      "  failureType: 'testCodeFailure'",
+      '  error: [unclosed',
+    ];
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(diag),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.ok(result.evidence.report_errors.includes('Malformed TAP'));
+  });
+
+  test('garbage after the TAP plan stays refused', () => {
+    const output = dupDiagTAP(THROWS_REGEXP_DIAG) + 'not tap garbage line\n';
+    const result = classifyRedEvidence(validRedInput({
+      output,
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'));
+  });
+
+  test('a whitespace-only extra event adds no non-TAP data issue after recovery', () => {
+    const output = dupDiagTAP(THROWS_REGEXP_DIAG).replace('\n1..1\n', '\n \t\n1..1\n');
+    const result = classifyRedEvidence(validRedInput({
+      output,
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.deepEqual(result.evidence.report_errors, ['Malformed TAP']);
+  });
+
+  test('a diagnostic block truncated before its closing ... is a truncated record, never RED', () => {
+    const truncated = dupDiagTAP(THROWS_REGEXP_DIAG).replace('  ...\n1..1', '');
+    const result = classifyRedEvidence(validRedInput({
+      output: truncated,
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.ok(result.evidence.report_errors.length > 0);
+  });
+
+  for (const [description, closer] of [
+    ['a suffix', '...x'], ['trailing whitespace', '... '], ['an extra dot', '....'], ['mismatched indentation', '  ...'],
+  ]) {
+    test(`a repeated-key block with ${description} on the closing delimiter stays refused`, () => {
+      const output = dupDiagTAP(["  error: 'first'", "  error: 'second'"])
+        .replace('\n  ...\n', `\n  ${closer}\n`);
+      const result = classifyRedEvidence(validRedInput({
+        output,
+        targetTest: 'rejects a malformed token',
+        targetFile: undefined,
+      }));
+      assert.equal(result.verdict, 'INVALID_RED');
+      assert.equal(result.reason, 'invalid_record');
+      assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'));
+    });
+  }
+
+  test('a nested repeated-key diagnostic with a mismatched closer indent stays refused', () => {
+    const nested = [
+      'TAP version 13', '# Subtest: token validation', '    # Subtest: rejects a malformed token',
+      '    not ok 1 - rejects a malformed token', '      ---', "      error: 'first'", "      error: 'second'",
+      '        ...', '    1..1', 'not ok 1 - token validation', '1..1', '',
+    ].join('\n');
+    const result = classifyRedEvidence(validRedInput({
+      output: nested,
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'));
+  });
+
+  test('a repeated-key diagnostic accepts CRLF with the exact closer and refuses an extra dot', () => {
+    const output = dupDiagTAP(THROWS_REGEXP_DIAG).replaceAll('\n', '\r\n');
+    const input = validRedInput({
+      output,
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    });
+    const recovered = classifyRedEvidence(input);
+    assert.equal(recovered.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(recovered.reason, 'target_test_failed');
+    assert.deepEqual(recovered.evidence.report_errors, []);
+    const refused = classifyRedEvidence({ ...input, output: output.replace('\r\n  ...\r\n', '\r\n  ....\r\n') });
+    assert.equal(refused.verdict, 'INVALID_RED');
+    assert.equal(refused.reason, 'invalid_record');
+    assert.ok(refused.evidence.report_errors.includes('Non-TAP data in report'));
+  });
+
+  const classifyDiagnostic = (lines) => classifyRedEvidence(validRedInput({
+    output: dupDiagTAP(lines),
+    targetTest: 'rejects a malformed token',
+    targetFile: undefined,
+  }));
+
+  test('duplicate recovery accepts 4096 framed lines and refuses an additional line', () => {
+    const diagnostic = ["  error: 'first'", ...Array(4092).fill('  # context'), "  error: 'second'"];
+    assert.equal(classifyDiagnostic(diagnostic).verdict, 'RED_EVIDENCE_OK');
+    const result = classifyDiagnostic([...diagnostic, '  # one more line']);
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'));
+    // The regular TAP path accepts the same block when its keys are unique.
+    assert.equal(classifyDiagnostic([...diagnostic.slice(0, -1), "  stack: 'second'", '  # one more line']).verdict,
+      'RED_EVIDENCE_OK');
+  });
+
+  test('duplicate recovery accepts 1 Mi UTF-16 code units and refuses one more', () => {
+    const diagnostic = ["  error: 'first'", '  # ', "  error: 'second'"];
+    // tap-parser re-emits the root delimiters without indentation.
+    const framing = ['---', ...diagnostic, '...', ''].join('\n');
+    const filler = '界'.repeat(1024 * 1024 - framing.length);
+    diagnostic[1] += filler;
+    assert.equal(classifyDiagnostic(diagnostic).verdict, 'RED_EVIDENCE_OK');
+    diagnostic[1] += 'x';
+    const result = classifyDiagnostic(diagnostic);
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'));
+  });
+
+  test('the framing boundary: an empty body is outside recovery either way it arrives', () => {
+    // Boundary rows for the `---`/`...` framing (CLAUDE.md boundary coverage): an
+    // EMPTY diagnostic block inside a test point carries no keys, so tap-parser's
+    // YAML parse returns nothing and the block is ignored — the report stays valid
+    // with no recovery involved. The same two lines loose in the stream (no test
+    // point owning them) are non-TAP data and the report is refused.
+    const emptyDiag = ['TAP version 13', '# Subtest: t', 'not ok 1 - t', '  ---', '  ...', '1..1', ''].join('\n');
+    const ignored = classifyRedEvidence({ command: 'node --test', exitCode: 1, output: emptyDiag, targetTest: 't' });
+    assert.equal(ignored.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(ignored.evidence.report_errors, []);
+    const strayMarkers = ['TAP version 13', '# Subtest: t', 'not ok 1 - t',
+      '  ---', "  error: 'a'", "  error: 'b'", '  ...', '---', '...', '1..1', ''].join('\n');
+    const refused = classifyRedEvidence({ command: 'node --test', exitCode: 1, output: strayMarkers, targetTest: 't' });
+    assert.equal(refused.verdict, 'INVALID_RED');
+    assert.ok(refused.evidence.report_errors.includes('Non-TAP data in report'));
+  });
+
+  test('a plan-first report truncated mid-diagnostic is refused even with a complete plan', () => {
+    // The truncation guard above is backstopped by the missing plan; this shape
+    // has a COMPLETE plan first, so only the recovered-block framing (the block
+    // re-emitted without its closing `...`) refuses it. A recovery that ignored
+    // the missing closer would wave a truncated stream through as RED.
+    const planFirstTruncated = [
+      'TAP version 13',
+      '1..1',
+      '# Subtest: rejects a malformed token',
+      'not ok 1 - rejects a malformed token',
+      '  ---',
+      "  failureType: 'testCodeFailure'",
+      "  error: 'first failure'",
+      "  error: 'second failure'",
+      '  stack: \'frame one\'',
+    ].join('\n');
+    const result = classifyRedEvidence(validRedInput({
+      output: planFirstTruncated,
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'invalid_record');
+    assert.ok(result.evidence.report_errors.includes('Non-TAP data in report'),
+      `expected the truncated block to stay non-TAP data, got ${JSON.stringify(result.evidence.report_errors)}`);
+  });
+
+  test('a recovered non-target failure reports the policy refusal, not a broken report', () => {
+    const points = ['ok 1 - rejects a malformed token', 'not ok 2 - unrelated legacy behavior'];
+    const result = classifyRedEvidence(validRedInput({
+      output: dupDiagTAP(THROWS_REGEXP_DIAG, points, '1..2'),
+      targetTest: 'rejects a malformed token',
+      targetFile: undefined,
+    }));
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+    assert.deepEqual(result.evidence.report_errors, []);
+  });
+});
+
+// ─── #5879: RED evidence must not block worktree.cleanup-wave ─────────────────
+// tdd.md told the executor to write the RED record "inside the project directory" and named no
+// place; an untracked evidence file in an agent worktree makes worktree.cleanup-wave refuse the
+// wave's merge as worktree_dirty. The reference now names one self-ignoring directory. The fixture
+// below takes the directory template, the ignore file and the confirmation command FROM tdd.md, so
+// a change to the instruction changes what the test exercises.
+describe('#5879: the RED-evidence location named by tdd.md cannot block the wave merge', () => {
+  const { runNode } = require('./helpers/process-seam.cjs');
+  const { gitOrThrow } = require('./helpers/git-fixture.cjs');
+  const { TOOLS_PATH } = require('./helpers.cjs');
+  const TDD_REFERENCE = path.join(__dirname, '..', 'gsd-core', 'references', 'tdd.md');
+  const GIT_ENV = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'r', GIT_AUTHOR_EMAIL: 'r@example.invalid',
+    GIT_COMMITTER_NAME: 'r', GIT_COMMITTER_EMAIL: 'r@example.invalid',
+  };
+
+  /** The location the reference names, read out of its evidence-location bullet. */
+  function documentedLocation() {
+    const bullet = fs.readFileSync(TDD_REFERENCE, 'utf8').split(/\r?\n/).find((l) => l.includes('Evidence location (#5879)'));
+    assert.ok(bullet, 'RED step 4 carries an evidence-location bullet');
+    const spans = bullet.split('`').filter((_, i) => i % 2 === 1); // the code spans between backticks
+    const dirTemplate = spans.find((s) => s.startsWith('.gsd/tdd-evidence/') && s.includes('{phase}-{plan}') && !s.includes('<file>'));
+    const ignoreFile = spans.find((s) => s.endsWith('/.gitignore'));
+    const checkTemplate = spans.find((s) => s.startsWith('git check-ignore -q '));
+    assert.ok(dirTemplate && ignoreFile && checkTemplate, `the bullet names the directory, the ignore file and the check: ${JSON.stringify(spans)}`);
+    assert.ok(/\bSTOP\b/.test(bullet), 'the bullet says to STOP when the check fails');
+    return { dirTemplate, ignoreFile, checkTemplate };
+  }
+
+  const RED_RECORD = {
+    command: 'node --test t.test.cjs', exitCode: 1, output: TARGET_FAILURE_TAP, targetTest: 'rejects empty email',
+  };
+
+  /** One executor worktree with a committed RED test and the evidence written by `writeEvidence`. */
+  function waveWithEvidence(writeEvidence) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-5879-'));
+    const git = (cwd, args) => gitOrThrow(args, { cwd, env: GIT_ENV });
+    git(dir, ['init', '-q', '-b', 'main']);
+    fs.mkdirSync(path.join(dir, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), '{}\n');
+    fs.writeFileSync(path.join(dir, '.gitignore'), '.claude/\n');
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-qm', 'base']);
+    const base = git(dir, ['rev-parse', 'HEAD']).trim();
+    const wt = path.join(dir, '.claude', 'worktrees', 'agent-a1');
+    git(dir, ['worktree', 'add', '-q', '-b', 'worktree-agent-a1', wt, base]);
+    fs.writeFileSync(path.join(wt, 't.test.js'), "test('t', () => { throw new Error('red'); });\n");
+    git(wt, ['add', 't.test.js']);
+    git(wt, ['commit', '-qm', 'test(01-01): add failing test']);
+    const evidence = writeEvidence(wt, git);
+    const manifest = path.join(dir, 'wave-manifest.json');
+    fs.writeFileSync(manifest, JSON.stringify({ orchestrator_root: dir, worktrees: [] }));
+    const run = (verb, extra) => runNode([TOOLS_PATH, 'query', verb, '--manifest', manifest, ...extra], { cwd: dir, env: GIT_ENV });
+    const recorded = run('worktree.record-agent', ['--agent-id', 'a1', '--path', wt, '--branch', 'worktree-agent-a1', '--base', base, '--files', 't.test.js']);
+    assert.equal(recorded.exitCode, 0, `record-agent failed: ${recorded.stderr}`);
+    const cleaned = run('worktree.cleanup-wave', []);
+    return { dir, cleaned, evidence, head: git(dir, ['log', '--format=%s', '-1']).trim(), parsed: JSON.parse(cleaned.stdout) };
+  }
+
+  test('an evidence file outside any ignored directory blocks the merge as worktree_dirty (the reported failure)', () => {
+    const w = waveWithEvidence((wt) => {
+      fs.mkdirSync(path.join(wt, '.tdd-evidence'), { recursive: true });
+      fs.writeFileSync(path.join(wt, '.tdd-evidence', '01-01-red.json'), JSON.stringify(RED_RECORD));
+    });
+    try {
+      assert.notEqual(w.cleaned.exitCode, 0);
+      const entry = w.parsed.result.entries[0];
+      assert.equal(entry.reason, 'worktree_dirty');
+      assert.ok(entry.stderr.includes('.tdd-evidence/01-01-red.json'), `the dirty line names the evidence file: ${entry.stderr}`);
+      assert.equal(w.head, 'base', 'the RED commit is left unmerged');
+    } finally { cleanup(w.dir); }
+  });
+
+  test('the location tdd.md names: porcelain stays clean, the classifier passes from the worktree root, the wave merges', () => {
+    const { dirTemplate, ignoreFile, checkTemplate } = documentedLocation();
+    const w = waveWithEvidence((wt, git) => {
+      const evidenceDir = path.join(wt, ...dirTemplate.replace('{phase}-{plan}', '01-01').split('/'));
+      fs.mkdirSync(evidenceDir, { recursive: true }); // mkdir -p
+      const ignorePath = path.join(wt, ...ignoreFile.split('/'));
+      if (!fs.existsSync(ignorePath)) fs.writeFileSync(ignorePath, '*\n');
+      const record = path.join(evidenceDir, 'red.json');
+      fs.writeFileSync(record, JSON.stringify(RED_RECORD));
+      fs.writeFileSync(path.join(evidenceDir, 'red.tap'), TARGET_FAILURE_TAP);
+      const rel = path.relative(wt, record).split(path.sep).join('/');
+      // the confirmation the reference requires: exit 1 (throws) if the file is not ignored
+      git(wt, checkTemplate.replace(/^git /, '').split(' ').slice(0, 2).concat(rel));
+      assert.equal(git(wt, ['status', '--porcelain', '--untracked-files=all']).trim(), '', 'nothing untracked');
+      const gate = runNode([TOOLS_PATH, 'check', 'tdd-red-evidence', rel, '--raw'], { cwd: wt, env: GIT_ENV });
+      return { gate };
+    });
+    try {
+      assert.match(w.evidence.gate.stdout, /RED_EVIDENCE_OK/, `the classifier accepts the record at the documented location: ${w.evidence.gate.stdout}${w.evidence.gate.stderr}`);
+      assert.equal(w.cleaned.exitCode, 0, `cleanup-wave failed: ${w.cleaned.stdout}${w.cleaned.stderr}`);
+      assert.equal(w.parsed.result.entries[0].status, 'merged_removed');
+      assert.match(w.head, /merge executor worktree/);
+    } finally { cleanup(w.dir); }
+  });
+
+  test('a linked worktree outside the repository with no .planning/ of its own still passes the classifier for its own record', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-5879-gate-'));
+    try {
+      const git = (cwd, args) => gitOrThrow(args, { cwd, env: GIT_ENV });
+      const repo = path.join(base, 'repo');
+      fs.mkdirSync(path.join(repo, '.planning'), { recursive: true });
+      git(repo, ['init', '-q', '-b', 'main']);
+      fs.writeFileSync(path.join(repo, '.planning', 'config.json'), '{}\n');
+      fs.writeFileSync(path.join(repo, '.gitignore'), '.planning/\n.gsd/\n');
+      fs.writeFileSync(path.join(repo, 'x'), 'x\n');
+      git(repo, ['add', 'x', '.gitignore']);
+      git(repo, ['commit', '-qm', 'base']);
+      const wt = path.join(base, 'wt'); // not under <repo>/.claude/worktrees
+      git(repo, ['worktree', 'add', '-q', '-b', 'wtb', wt]);
+      assert.equal(fs.existsSync(path.join(wt, '.planning')), false, 'the fixture worktree has no .planning/');
+      fs.mkdirSync(path.join(wt, '.gsd', 'tdd-evidence', '01-01'), { recursive: true });
+      fs.writeFileSync(path.join(wt, '.gsd', 'tdd-evidence', '01-01', 'red.json'), JSON.stringify(RED_RECORD));
+      const own = runNode([TOOLS_PATH, 'check', 'tdd-red-evidence', '.gsd/tdd-evidence/01-01/red.json', '--raw'], { cwd: wt, env: GIT_ENV });
+      assert.match(own.stdout, /RED_EVIDENCE_OK/, `own-worktree record: ${own.stdout}${own.stderr}`);
+      fs.writeFileSync(path.join(base, 'elsewhere.json'), JSON.stringify(RED_RECORD));
+      const outside = runNode([TOOLS_PATH, 'check', 'tdd-red-evidence', path.join(base, 'elsewhere.json'), '--raw'], { cwd: wt, env: GIT_ENV });
+      assert.notEqual(outside.exitCode, 0);
+      assert.match(outside.stderr + outside.stdout, /path escapes its allowed directory/);
+    } finally { cleanup(base); }
+  });
+});

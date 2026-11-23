@@ -1,0 +1,1188 @@
+'use strict';
+
+/**
+ * tests/ci-timeout-report.test.cjs
+ *
+ * Unit tests for scripts/ci-timeout-report.cjs's pure exports (#4036).
+ * main() is impure orchestration requiring a live Octokit/GitHub Actions
+ * context and is intentionally NOT covered here.
+ */
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fc = require('./helpers/fast-check-setup.cjs');
+const { declaredWindowsConformanceShards } = require('./helpers/shard-spec.cjs');
+
+const {
+  resolveJobTimeoutMinutes,
+  parseJobRecord,
+  buildReportLines,
+  dedupeAgainstHistory,
+} = require('../scripts/ci-timeout-report.cjs');
+
+test('resolveJobTimeoutMinutes', async (t) => {
+  await t.test('static job: resolves timeout-minutes from workflow YAML', () => {
+    const yamlText = [
+      'jobs:',
+      '  test:',
+      '    timeout-minutes: 15',
+      '',
+    ].join('\n');
+
+    const result = resolveJobTimeoutMinutes({
+      jobName: 'test (ubuntu-latest, 24, shard 1/3)',
+      workflowFile: 'test.yml',
+      workflowYamlText: yamlText,
+      covered: null,
+    });
+
+    assert.equal(result, 15);
+  });
+
+  await t.test('mutation job: resolves override timeoutMinutes from COVERED', () => {
+    const result = resolveJobTimeoutMinutes({
+      jobName: 'Stryker (frontmatter)',
+      workflowFile: 'mutation.yml',
+      workflowYamlText: null,
+      covered: { frontmatter: { timeoutMinutes: 20 }, 'adr-parser': {} },
+    });
+
+    assert.equal(result, 20);
+  });
+
+  await t.test('mutation job: falls back to default 15 when no override', () => {
+    const result = resolveJobTimeoutMinutes({
+      jobName: 'Stryker (adr-parser)',
+      workflowFile: 'mutation.yml',
+      workflowYamlText: null,
+      covered: { frontmatter: { timeoutMinutes: 20 }, 'adr-parser': {} },
+    });
+
+    assert.equal(result, 15);
+  });
+
+  await t.test('mutation job: unknown module returns null', () => {
+    const result = resolveJobTimeoutMinutes({
+      jobName: 'Stryker (totally-unknown-module)',
+      workflowFile: 'mutation.yml',
+      workflowYamlText: null,
+      covered: { frontmatter: { timeoutMinutes: 20 }, 'adr-parser': {} },
+    });
+
+    assert.equal(result, null);
+  });
+
+  await t.test('test-inert resolves against the test-inert job key, not test', () => {
+    const yamlText = [
+      'jobs:',
+      '  test:',
+      '    timeout-minutes: 15',
+      '  test-inert:',
+      '    timeout-minutes: 2',
+      '',
+    ].join('\n');
+
+    const result = resolveJobTimeoutMinutes({
+      jobName: 'test (inert CI)',
+      workflowFile: 'test.yml',
+      workflowYamlText: yamlText,
+      covered: null,
+    });
+
+    assert.equal(result, 2);
+  });
+});
+
+test('parseJobRecord', async (t) => {
+  await t.test('still-running job (completed_at null) returns null', () => {
+    const result = parseJobRecord({
+      job: {
+        name: 'test (ubuntu-latest, 24, shard 1/3)',
+        completed_at: null,
+        started_at: '2026-08-29T00:00:00Z',
+        run_id: 1,
+        head_sha: 'abc123',
+        runEvent: 'pull_request',
+      },
+      workflowFile: 'test.yml',
+      workflowYamlText: 'jobs:\n  test:\n    timeout-minutes: 15\n',
+      covered: null,
+    });
+
+    assert.equal(result, null);
+  });
+
+  await t.test('untracked job name returns null', () => {
+    for (const jobName of ['preflight', 'changes', 'lint-tests']) {
+      const result = parseJobRecord({
+        job: {
+          name: jobName,
+          completed_at: '2026-08-29T00:10:00Z',
+          started_at: '2026-08-29T00:00:00Z',
+          run_id: 1,
+          head_sha: 'abc123',
+          runEvent: 'pull_request',
+        },
+        workflowFile: 'test.yml',
+        workflowYamlText: 'jobs:\n  test:\n    timeout-minutes: 15\n',
+        covered: null,
+      });
+
+      assert.equal(result, null, `expected null for job name ${jobName}`);
+    }
+  });
+
+  await t.test('valid smoke job returns a full record', () => {
+    const yamlText = [
+      'jobs:',
+      '  smoke:',
+      '    timeout-minutes: 12',
+      '',
+    ].join('\n');
+
+    const result = parseJobRecord({
+      job: {
+        name: 'smoke (ubuntu-latest)',
+        started_at: '2026-08-29T00:00:00Z',
+        completed_at: '2026-08-29T00:06:00Z',
+        run_id: 42,
+        head_sha: 'deadbeef',
+        runEvent: 'push',
+      },
+      workflowFile: 'install-smoke.yml',
+      workflowYamlText: yamlText,
+      covered: null,
+    });
+
+    assert.ok(result);
+    assert.equal(result.jobName, 'smoke (ubuntu-latest)');
+    assert.equal(result.workflowFile, 'install-smoke.yml');
+    assert.equal(result.runId, 42);
+    assert.equal(result.sha, 'deadbeef');
+    assert.equal(result.runEvent, 'push');
+    assert.equal(result.timeoutMinutes, 12);
+    assert.equal(typeof result.pct, 'number');
+  });
+});
+
+test('dedupeAgainstHistory', async (t) => {
+  await t.test('excludes only the record already present in history', () => {
+    const records = [
+      { runId: 1, jobName: 'test (ubuntu-latest, 24, shard 1/3)', pct: 0.5 },
+      { runId: 2, jobName: 'test (ubuntu-latest, 24, shard 2/3)', pct: 0.6 },
+    ];
+    const historyText = `${JSON.stringify({ runId: 1, jobName: 'test (ubuntu-latest, 24, shard 1/3)' })}\n`;
+
+    const result = dedupeAgainstHistory(records, historyText);
+
+    assert.equal(result.length, 1);
+    assert.equal(result[0].runId, 2);
+  });
+
+  await t.test('same runId, different jobName: both kept when history is empty', () => {
+    const records = [
+      { runId: 1, jobName: 'test (ubuntu-latest, 24, shard 1/3)', pct: 0.5 },
+      { runId: 1, jobName: 'test (ubuntu-latest, 24, shard 2/3)', pct: 0.6 },
+    ];
+
+    const result = dedupeAgainstHistory(records, '');
+
+    assert.equal(result.length, 2);
+  });
+
+  await t.test('malformed history lines are skipped, not thrown', () => {
+    const records = [
+      { runId: 1, jobName: 'test (ubuntu-latest, 24, shard 1/3)', pct: 0.5 },
+      { runId: 2, jobName: 'test (ubuntu-latest, 24, shard 2/3)', pct: 0.6 },
+    ];
+    const historyText = [
+      JSON.stringify({ runId: 1, jobName: 'test (ubuntu-latest, 24, shard 1/3)' }),
+      '',
+      'not json{',
+      '',
+    ].join('\n');
+
+    const result = dedupeAgainstHistory(records, historyText);
+
+    assert.equal(result.length, 1);
+    assert.equal(result[0].runId, 2);
+  });
+});
+
+test('buildReportLines', async (t) => {
+  await t.test('end-to-end: only tracked+completed jobs produce records', () => {
+    const workflowYamlText = [
+      'jobs:',
+      '  test:',
+      '    timeout-minutes: 15',
+      '',
+    ].join('\n');
+
+    const runs = [
+      {
+        run: { id: 1, head_sha: 'sha1', event: 'pull_request' },
+        jobs: [
+          {
+            name: 'test (ubuntu-latest, 24, shard 1/3)',
+            started_at: '2026-08-29T00:00:00Z',
+            completed_at: '2026-08-29T00:05:00Z',
+          },
+          {
+            name: 'test (ubuntu-latest, 24, shard 2/3)',
+            started_at: '2026-08-29T00:00:00Z',
+            completed_at: null,
+          },
+          {
+            name: 'lint-tests',
+            started_at: '2026-08-29T00:00:00Z',
+            completed_at: '2026-08-29T00:01:00Z',
+          },
+        ],
+      },
+      {
+        run: { id: 2, head_sha: 'sha2', event: 'push' },
+        jobs: [
+          {
+            name: 'test (ubuntu-latest, 24, shard 3/3)',
+            started_at: '2026-08-29T00:00:00Z',
+            completed_at: '2026-08-29T00:07:00Z',
+          },
+        ],
+      },
+    ];
+
+    const result = buildReportLines(runs, { workflowFile: 'test.yml', workflowYamlText, covered: null });
+
+    assert.equal(result.length, 2);
+    const names = result.map((r) => r.jobName).sort();
+    assert.deepEqual(names, [
+      'test (ubuntu-latest, 24, shard 1/3)',
+      'test (ubuntu-latest, 24, shard 3/3)',
+    ]);
+    for (const name of names) {
+      assert.equal(names.filter((n) => n === name).length, 1);
+    }
+  });
+});
+
+// #5088: GitHub's jobs API reports `completed_at` one second BEFORE
+// `started_at` for a job that never executed (every observed case was
+// `skipped` or `cancelled`), and a skipped job also carries a `completed_at`.
+// parseJobRecord used to hand those timestamps to computeElapsedPct, which
+// throws on negative elapsed time — and nothing above it catches, so ONE
+// such job discarded the whole scheduled report. A job that never ran has no
+// duration to report; a cancelled job that DID run (the timeout-killed case
+// this report exists to catch) must still be recorded.
+test('parseJobRecord skips jobs that never executed (#5088)', async (t) => {
+  const yamlText = 'jobs:\n  test:\n    timeout-minutes: 45\n';
+  const parse = (job) => parseJobRecord({
+    job: { name: 'test (ubuntu-latest, 24, shard 1/3)', run_id: 7, head_sha: 'abc', runEvent: 'push', ...job },
+    workflowFile: 'test.yml',
+    workflowYamlText: yamlText,
+    covered: null,
+  });
+
+  await t.test('skipped job with completed_at 1s before started_at returns null', () => {
+    assert.equal(parse({ conclusion: 'skipped', started_at: '2026-09-28T11:19:38Z', completed_at: '2026-09-28T11:19:37Z' }), null);
+  });
+
+  await t.test('cancelled-before-start job with inverted timestamps returns null', () => {
+    assert.equal(parse({ conclusion: 'cancelled', started_at: '2026-09-28T11:18:56Z', completed_at: '2026-09-28T11:18:55Z' }), null);
+  });
+
+  await t.test('skipped job with non-inverted timestamps still returns null', () => {
+    assert.equal(parse({ conclusion: 'skipped', started_at: '2026-09-28T11:19:38Z', completed_at: '2026-09-28T11:19:38Z' }), null);
+  });
+
+  await t.test('missing or unparseable started_at returns null instead of throwing', () => {
+    for (const started_at of [null, undefined, '', 'not-a-date']) {
+      assert.equal(parse({ conclusion: 'cancelled', started_at, completed_at: '2026-09-28T11:18:55Z' }), null, String(started_at));
+    }
+  });
+
+  await t.test('unparseable completed_at returns null instead of throwing', () => {
+    assert.equal(parse({ conclusion: 'success', started_at: '2026-09-28T11:00:00Z', completed_at: 'garbage' }), null);
+  });
+
+  await t.test('boundary: completed_at == started_at is treated as never executed', () => {
+    // One-second timestamp resolution: no job that ran starts and ends in the same second.
+    assert.equal(parse({ conclusion: 'cancelled', started_at: '2026-09-28T11:00:00Z', completed_at: '2026-09-28T11:00:00Z' }), null);
+  });
+
+  await t.test('a record without a string name returns null instead of throwing', () => {
+    for (const name of [undefined, null, 42]) {
+      assert.equal(parse({ name, conclusion: 'success', started_at: '2026-09-28T10:00:00Z', completed_at: '2026-09-28T10:10:00Z' }), null, String(name));
+    }
+  });
+
+  await t.test('boundary: completed_at 1s after started_at is recorded', () => {
+    const rec = parse({ conclusion: 'success', started_at: '2026-09-28T11:00:00Z', completed_at: '2026-09-28T11:00:01Z' });
+    assert.ok(rec);
+    assert.equal(rec.pct, 1000 / (45 * 60000));
+  });
+
+  await t.test('a cancelled job that ran to its cap is still recorded (the timeout-killed case)', () => {
+    const rec = parse({ conclusion: 'cancelled', started_at: '2026-09-28T10:00:00Z', completed_at: '2026-09-28T10:45:00Z' });
+    assert.ok(rec);
+    assert.equal(rec.pct, 1);
+  });
+});
+
+test('buildReportLines keeps every real record when one job never executed (#5088)', () => {
+  const yamlText = 'jobs:\n  test:\n    timeout-minutes: 45\n';
+  const jobs = [
+    { name: 'test (ubuntu-latest, 24, shard 1/3)', conclusion: 'success', started_at: '2026-09-28T10:00:00Z', completed_at: '2026-09-28T10:10:00Z' },
+    { name: 'test (ubuntu-latest, 24, shard 2/3)', conclusion: 'skipped', started_at: '2026-09-28T10:00:01Z', completed_at: '2026-09-28T10:00:00Z' },
+    { name: 'test (ubuntu-latest, 24, shard 3/3)', conclusion: 'failure', started_at: '2026-09-28T10:00:00Z', completed_at: '2026-09-28T10:20:00Z' },
+  ];
+  const records = buildReportLines([{ run: { id: 36393086320, head_sha: '9ebd2b006', event: 'schedule' }, jobs }], {
+    workflowFile: 'test.yml',
+    workflowYamlText: yamlText,
+    covered: null,
+  });
+  assert.deepEqual(records.map((r) => r.jobName), [
+    'test (ubuntu-latest, 24, shard 1/3)',
+    'test (ubuntu-latest, 24, shard 3/3)',
+  ]);
+});
+
+/**
+ * shard balance (#5101) — Windows conformance shard-balance check.
+ * Fixtures follow the GitHub jobs-API shape: `{ run: {id, created_at,
+ * head_sha, event}, jobs }` for the pure pipeline (extractShardSamples /
+ * evaluateShardBalance), and flat `{id, created_at, head_sha, event}` runs
+ * plus a run-id -> jobs map for the impure checkShardBalance orchestration,
+ * matching what the real Octokit calls hand back.
+ */
+
+const {
+  SHARD_BALANCE,
+  jobSpanMs,
+  median,
+  percentile,
+  extractShardSamples,
+  evaluateShardBalance,
+  formatShardBalanceSummary,
+  checkShardBalance,
+} = require('../scripts/ci-timeout-report.cjs');
+
+// #5029: the live SHARD_BALANCE describes whatever layout test.yml declares.
+// The rule tests below are written against
+// 3-shard fixtures — the layout #5101 shipped with — so they run on this
+// frozen copy of the #5101 config instead: they pin the rules (window, gap,
+// p90, layout-change handling), not the current baselines. Every field is
+// written out, none inherited, so a change to the live config cannot move
+// these fixtures. The live config's wiring is pinned separately by
+// "SHARD_BALANCE matches the windows shard layout test.yml declares".
+const THREE_SHARD_CONFIG = Object.freeze({
+  workflowFile: 'test.yml',
+  branch: 'next',
+  event: 'push',
+  since: '2026-09-28T14:17:51Z', // #5097 merge
+  minRuns: 10,
+  windowRuns: 20,
+  // #5101's own gap limit; the 120000/120001 boundary tests below are about
+  // this one, not the live limit sized for the layout #5029 declared.
+  maxMedianGapMs: 120000,
+  baselineShardTotal: 3,
+  baselineP90Ms: Object.freeze({ '1/3': 1824000, '2/3': 2046000, '3/3': 2208000 }),
+  issueTitle: 'CI: Windows conformance shard balance regressed',
+});
+
+function addMs(iso, ms) {
+  return new Date(new Date(iso).getTime() + ms).toISOString();
+}
+
+function winJobFromMs(i, n, ms, { conclusion = 'success', start = '2026-09-29T10:00:00Z' } = {}) {
+  return {
+    name: `conformance test (windows-latest, 24, shard ${i}/${n})`,
+    conclusion,
+    started_at: start,
+    completed_at: addMs(start, ms),
+  };
+}
+
+function winJob(i, n, minutes, opts = {}) {
+  return winJobFromMs(i, n, Math.round(minutes * 60000), opts);
+}
+
+function runAt(id, createdAt, jobs) {
+  return { run: { id, created_at: createdAt, head_sha: `sha${id}`, event: 'push' }, jobs };
+}
+
+// Builds `n` runs from one ms-array per shard (shardMsLists[shardIdx][runIdx]),
+// spaced `stepMs` apart starting at `base`, so callers can control every
+// shard/run combination precisely (constant arrays => constant medians/p90s).
+function buildRunsFromShardLists(shardMsLists, { startId = 1, base = '2026-09-29T00:00:00Z', stepMs = 3600000 } = {}) {
+  const total = shardMsLists.length;
+  const n = shardMsLists[0].length;
+  const runs = [];
+  for (let k = 0; k < n; k += 1) {
+    const id = startId + k;
+    const createdAt = addMs(base, k * stepMs);
+    const jobs = shardMsLists.map((list, idx) => winJobFromMs(idx + 1, total, list[k], { start: createdAt }));
+    runs.push(runAt(id, createdAt, jobs));
+  }
+  return runs;
+}
+
+function constantRuns(n, shardMsValues, opts = {}) {
+  return buildRunsFromShardLists(shardMsValues.map((ms) => new Array(n).fill(ms)), opts);
+}
+
+test('shard balance (#5101)', async (t) => {
+  await t.test('median and percentile use the documented definitions', () => {
+    assert.equal(median([5]), 5);
+    assert.equal(median([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 5.5);
+    assert.equal(median([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), 6);
+
+    assert.equal(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9), 9);
+    assert.equal(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 0.9), 10);
+    assert.equal(percentile([7], 0.9), 7);
+  });
+
+  await t.test('jobSpanMs returns null for a job that never executed', () => {
+    const normal = winJob(1, 3, 5);
+    assert.equal(jobSpanMs(normal), 300000);
+
+    const skipped = winJobFromMs(1, 3, 300000, { conclusion: 'skipped' });
+    assert.equal(jobSpanMs(skipped), null);
+
+    const equal = { ...winJob(1, 3, 0) };
+    assert.equal(jobSpanMs(equal), null);
+
+    const inverted = {
+      name: 'conformance test (windows-latest, 24, shard 1/3)',
+      conclusion: 'success',
+      started_at: '2026-09-29T10:05:00Z',
+      completed_at: '2026-09-29T10:00:00Z',
+    };
+    assert.equal(jobSpanMs(inverted), null);
+
+    const missing = {
+      name: 'conformance test (windows-latest, 24, shard 1/3)',
+      conclusion: 'success',
+      started_at: null,
+      completed_at: '2026-09-29T10:05:00Z',
+    };
+    assert.equal(jobSpanMs(missing), null);
+
+    const garbage = {
+      name: 'conformance test (windows-latest, 24, shard 1/3)',
+      conclusion: 'success',
+      started_at: 'not-a-date',
+      completed_at: 'also-not-a-date',
+    };
+    assert.equal(jobSpanMs(garbage), null);
+  });
+
+  await t.test('extractShardSamples keeps only Windows conformance shards', () => {
+    const start = '2026-09-29T10:00:00Z';
+    const runs = [runAt(1, start, [
+      winJob(1, 3, 20, { start }),
+      { name: 'conformance test (macos-latest, 24, shard 1/3)', conclusion: 'success', started_at: start, completed_at: addMs(start, 20 * 60000) },
+      { name: 'test (ubuntu-latest, 24, shard 1/3)', conclusion: 'success', started_at: start, completed_at: addMs(start, 20 * 60000) },
+      { name: 'conformance test (windows-latest, 24)', conclusion: 'success', started_at: start, completed_at: addMs(start, 20 * 60000) },
+    ])];
+
+    const samples = extractShardSamples(runs, THREE_SHARD_CONFIG);
+
+    assert.equal(samples.length, 1);
+    assert.equal(samples[0].shard, '1/3');
+    assert.equal(samples[0].index, 1);
+    assert.equal(samples[0].total, 3);
+  });
+
+  await t.test('runs before the #5097 merge are excluded', () => {
+    const before = runAt(1, '2026-09-28T14:17:50Z', [winJob(1, 3, 20, { start: '2026-09-28T14:17:50Z' })]);
+    const atSince = runAt(2, THREE_SHARD_CONFIG.since, [winJob(1, 3, 20, { start: THREE_SHARD_CONFIG.since })]);
+
+    const samples = extractShardSamples([before, atSince], THREE_SHARD_CONFIG);
+
+    assert.equal(samples.length, 1);
+    assert.equal(samples[0].runId, 2);
+  });
+
+  await t.test('a cancelled shard that ran still counts', () => {
+    const start = '2026-09-29T10:00:00Z';
+    const cancelledWithSpan = winJobFromMs(1, 3, 44 * 60000, { start, conclusion: 'cancelled' });
+    const neverRan = {
+      name: 'conformance test (windows-latest, 24, shard 2/3)',
+      conclusion: 'skipped',
+      started_at: start,
+      completed_at: null,
+    };
+    const runs = [runAt(1, start, [cancelledWithSpan, neverRan])];
+
+    const samples = extractShardSamples(runs, THREE_SHARD_CONFIG);
+
+    assert.equal(samples.length, 1);
+    assert.equal(samples[0].shard, '1/3');
+  });
+
+  await t.test('no samples reports insufficient-data', () => {
+    const result = evaluateShardBalance([], THREE_SHARD_CONFIG);
+
+    assert.equal(result.status, 'insufficient-data');
+    assert.equal(result.runs, 0);
+  });
+
+  await t.test('run-count boundary 9, 10, 11', () => {
+    const shardMs = [20 * 60000, 20.5 * 60000, 21 * 60000];
+
+    const nine = evaluateShardBalance(extractShardSamples(constantRuns(9, shardMs), THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+    assert.equal(nine.status, 'insufficient-data');
+    assert.equal(nine.runs, 9);
+
+    const ten = evaluateShardBalance(extractShardSamples(constantRuns(10, shardMs), THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+    assert.equal(ten.status, 'ok');
+    assert.equal(ten.runs, 10);
+
+    const eleven = evaluateShardBalance(extractShardSamples(constantRuns(11, shardMs), THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+    assert.equal(eleven.status, 'ok');
+    assert.equal(eleven.runs, 11);
+  });
+
+  await t.test('median gap boundary at 2 minutes', () => {
+    const okRuns = constantRuns(10, [1200000, 1200000, 1200000 + 120000]);
+    const okResult = evaluateShardBalance(extractShardSamples(okRuns, THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+    assert.equal(okResult.status, 'ok');
+    assert.equal(okResult.gapMs, 120000);
+
+    const breachRuns = constantRuns(10, [1200000, 1200000, 1200000 + 120001]);
+    const breachResult = evaluateShardBalance(extractShardSamples(breachRuns, THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+    assert.equal(breachResult.status, 'breach');
+    assert.equal(breachResult.gapMs, 120001);
+    assert.deepEqual(breachResult.breaches.map((b) => [b.kind, b.slowest, b.fastest]), [['gap', '3/3', '1/3']]);
+  });
+
+  await t.test('p90 boundary at the shard baseline', () => {
+    const shard1AtBaseline = [
+      1740000, 1740000, 1740000, 1740000, 1740000,
+      1740000, 1740000, 1740000, 1824000, 1824000,
+    ];
+    const shard1OverBaseline = [
+      1740000, 1740000, 1740000, 1740000, 1740000,
+      1740000, 1740000, 1740000, 1824001, 1824001,
+    ];
+    const steadyShard = new Array(10).fill(1740000);
+
+    const okResult = evaluateShardBalance(
+      extractShardSamples(buildRunsFromShardLists([shard1AtBaseline, steadyShard, steadyShard]), THREE_SHARD_CONFIG),
+      THREE_SHARD_CONFIG,
+    );
+    assert.equal(okResult.status, 'ok');
+
+    const breachResult = evaluateShardBalance(
+      extractShardSamples(buildRunsFromShardLists([shard1OverBaseline, steadyShard, steadyShard]), THREE_SHARD_CONFIG),
+      THREE_SHARD_CONFIG,
+    );
+    assert.equal(breachResult.status, 'breach');
+    assert.deepEqual(breachResult.breaches.map((b) => [b.kind, b.shard]), [['p90', '1/3']]);
+  });
+
+  await t.test('a shard-layout change reports baseline-mismatch', () => {
+    const oldRuns = constantRuns(THREE_SHARD_CONFIG.minRuns, [1200000, 1200000, 1200000], { startId: 1, base: '2026-09-28T15:00:00Z' });
+    const newRuns = constantRuns(5, [1200000, 1200000, 1200000, 1200000], { startId: 101, base: '2026-09-30T15:00:00Z' });
+
+    const result = evaluateShardBalance(extractShardSamples([...oldRuns, ...newRuns], THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+
+    assert.equal(result.status, 'baseline-mismatch');
+  });
+
+  // #5029: right after a re-shard merges, the baseline describes a layout no
+  // completed run uses yet. A mismatch needs minRuns runs of the baseline's
+  // own layout first, so the check cannot file an issue against the re-shard.
+  await t.test('a baseline layout with no runs yet is insufficient-data, not a mismatch (#5029)', () => {
+    const runs = constantRuns(5, [1200000, 1200000, 1200000, 1200000]);
+
+    const result = evaluateShardBalance(extractShardSamples(runs, THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+
+    assert.equal(result.status, 'insufficient-data');
+    assert.equal(result.total, 4);
+  });
+
+  await t.test('baseline-mismatch waits for minRuns runs of the baseline layout (#5029)', () => {
+    const { minRuns } = THREE_SHARD_CONFIG;
+    const statusWith = (baselineLayoutRuns) => {
+      const oldRuns = constantRuns(baselineLayoutRuns, [1200000, 1200000, 1200000], { startId: 1, base: '2026-09-28T15:00:00Z' });
+      const newRuns = constantRuns(5, [1200000, 1200000, 1200000, 1200000], { startId: 101, base: '2026-09-30T15:00:00Z' });
+      return evaluateShardBalance(extractShardSamples([...oldRuns, ...newRuns], THREE_SHARD_CONFIG), THREE_SHARD_CONFIG).status;
+    };
+
+    assert.equal(statusWith(minRuns - 1), 'insufficient-data');
+    assert.equal(statusWith(minRuns), 'baseline-mismatch');
+    assert.equal(statusWith(minRuns + 1), 'baseline-mismatch');
+  });
+
+  // #6329: a run counts toward minRuns only when every shard of the baseline
+  // layout has a sample. A run with a shard missing (cancelled before it got
+  // a runner, say) does not establish the layout.
+  await t.test('baseline-mismatch counts only complete baseline-layout runs (#6329)', () => {
+    const { minRuns, baselineShardTotal } = THREE_SHARD_CONFIG;
+    const statusWith = (completeRuns, shardsInLastBaselineRun) => {
+      const complete = constantRuns(completeRuns, [1200000, 1200000, 1200000], { startId: 1, base: '2026-09-28T15:00:00Z' });
+      const last = constantRuns(1, [1200000, 1200000, 1200000], { startId: 51, base: '2026-09-29T15:00:00Z' });
+      last[0].jobs.splice(shardsInLastBaselineRun);
+      const newRuns = constantRuns(5, [1200000, 1200000, 1200000, 1200000], { startId: 101, base: '2026-09-30T15:00:00Z' });
+      return evaluateShardBalance(
+        extractShardSamples([...complete, ...last, ...newRuns], THREE_SHARD_CONFIG),
+        THREE_SHARD_CONFIG,
+      ).status;
+    };
+
+    // minRuns - 1 complete runs plus one run short of a shard: not established.
+    assert.equal(statusWith(minRuns - 1, 1), 'insufficient-data');
+    assert.equal(statusWith(minRuns - 1, baselineShardTotal - 1), 'insufficient-data');
+    // The same run with every shard present is the minRuns-th complete run.
+    assert.equal(statusWith(minRuns - 1, baselineShardTotal), 'baseline-mismatch');
+    // A partial run does not subtract from the complete ones.
+    assert.equal(statusWith(minRuns, baselineShardTotal - 1), 'baseline-mismatch');
+  });
+
+  // #6329: completeness is every shard 1..total present, not a count of
+  // samples. Neither a shard sampled twice nor an out-of-range index stands in
+  // for a missing shard.
+  await t.test('a duplicated or out-of-range shard does not complete a baseline-layout run (#6329)', () => {
+    const { minRuns, baselineShardTotal } = THREE_SHARD_CONFIG;
+    const start = '2026-09-29T15:00:00Z';
+    const statusWithLastRun = (shardIndexes) => {
+      const complete = constantRuns(minRuns - 1, [1200000, 1200000, 1200000], { startId: 1, base: '2026-09-28T15:00:00Z' });
+      const last = runAt(51, start, shardIndexes.map((i) => winJobFromMs(i, baselineShardTotal, 1200000, { start })));
+      const newRuns = constantRuns(5, [1200000, 1200000, 1200000, 1200000], { startId: 101, base: '2026-09-30T15:00:00Z' });
+      return evaluateShardBalance(
+        extractShardSamples([...complete, last, ...newRuns], THREE_SHARD_CONFIG),
+        THREE_SHARD_CONFIG,
+      ).status;
+    };
+
+    assert.equal(statusWithLastRun([1, 1, 2]), 'insufficient-data', 'shard 1 twice, shard 3 missing');
+    assert.equal(statusWithLastRun([1, 2, baselineShardTotal + 1]), 'insufficient-data', 'an index past the total');
+    assert.equal(statusWithLastRun([1, 2, 0]), 'insufficient-data', 'index zero');
+    assert.equal(statusWithLastRun([1, '01', 2]), 'insufficient-data', 'a zero-padded second spelling of shard 1');
+    assert.equal(statusWithLastRun([1, 1, 2, 3]), 'baseline-mismatch', 'a duplicate beside a complete set');
+  });
+
+  await t.test('mixed layouts use only the newest layout', () => {
+    const oldRuns = constantRuns(12, [1200000, 1200000, 1200000], { startId: 1, base: '2026-09-28T15:00:00Z' });
+    const newRuns = constantRuns(10, [1200000, 1200000, 1200000, 1200000], { startId: 101, base: '2026-09-29T15:00:00Z' });
+
+    const result = evaluateShardBalance(extractShardSamples([...oldRuns, ...newRuns], THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+
+    assert.equal(result.status, 'baseline-mismatch');
+    assert.equal(result.runs, 10);
+  });
+
+  await t.test('only the newest windowRuns runs are evaluated', () => {
+    const oldUnbalanced = constantRuns(5, [1200000, 1200000, 100 * 60000], { startId: 1, base: '2026-09-27T00:00:00Z' });
+    const newBalanced = constantRuns(20, [1200000, 1200000, 1200000], { startId: 101, base: '2026-09-29T00:00:00Z' });
+
+    const result = evaluateShardBalance(
+      extractShardSamples([...oldUnbalanced, ...newBalanced], THREE_SHARD_CONFIG),
+      THREE_SHARD_CONFIG,
+    );
+
+    assert.equal(result.status, 'ok');
+    assert.equal(result.runs, 20);
+  });
+
+  await t.test('a run missing one shard still counts its others', () => {
+    const runs = constantRuns(10, [1200000, 1200000, 1200000]);
+    runs[4].jobs.splice(1, 1); // drop shard 2/3 from the 5th run
+
+    const result = evaluateShardBalance(extractShardSamples(runs, THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+
+    assert.equal(result.runs, 10);
+    const shard2 = result.perShard.find((s) => s.shard === '2/3');
+    const shard1 = result.perShard.find((s) => s.shard === '1/3');
+    const shard3 = result.perShard.find((s) => s.shard === '3/3');
+    assert.equal(shard2.n, 9);
+    assert.equal(shard1.n, 10);
+    assert.equal(shard3.n, 10);
+  });
+
+  await t.test('fewer than two populated shards is insufficient-data', () => {
+    const runs = [];
+    for (let k = 0; k < 10; k += 1) {
+      const createdAt = addMs('2026-09-29T00:00:00Z', k * 3600000);
+      runs.push(runAt(k + 1, createdAt, [winJobFromMs(1, 3, 1200000, { start: createdAt })]));
+    }
+
+    const result = evaluateShardBalance(extractShardSamples(runs, THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+
+    assert.equal(result.status, 'insufficient-data');
+  });
+
+  await t.test('the #5071 baseline itself is a breach', () => {
+    const runs = constantRuns(10, [25.2 * 60000, 29.0 * 60000, 31.6 * 60000]);
+
+    const result = evaluateShardBalance(extractShardSamples(runs, THREE_SHARD_CONFIG), THREE_SHARD_CONFIG);
+
+    assert.equal(result.status, 'breach');
+    assert.equal(result.gapMs, 384000);
+    assert.ok(result.breaches.length >= 1);
+
+    const summary = formatShardBalanceSummary(result);
+    assert.equal(typeof summary, 'string');
+    assert.ok(summary.length > 0);
+  });
+
+  function makeGithub({ runs, jobsByRunId, existingIssues = [], failListRuns = false }) {
+    const calls = { create: [], comment: [] };
+    const github = {
+      paginate: async (fn, params) => fn(params),
+      rest: {
+        actions: {
+          listWorkflowRuns: async () => {
+            if (failListRuns) throw new Error('simulated GitHub API failure');
+            return runs;
+          },
+          listJobsForWorkflowRun: async (p) => jobsByRunId[p.run_id],
+        },
+        search: {
+          issuesAndPullRequests: async () => ({ data: { items: existingIssues } }),
+        },
+        issues: {
+          create: async (p) => {
+            calls.create.push(p);
+            return { data: { number: 999 } };
+          },
+          createComment: async (p) => {
+            calls.comment.push(p);
+            return { data: {} };
+          },
+        },
+      },
+    };
+    return { github, calls };
+  }
+
+  function makeCore() {
+    const warnings = [];
+    const summaries = [];
+    const core = {
+      warning: (m) => warnings.push(m),
+      info() {},
+      summary: {
+        addRaw(s) {
+          summaries.push(s);
+          return this;
+        },
+        write: async () => {},
+      },
+    };
+    return { core, warnings, summaries };
+  }
+
+  const context = { repo: { owner: 'open-gsd', repo: 'gsd-core' } };
+
+  function breachFixture() {
+    const runs = [];
+    const jobsByRunId = {};
+    for (let k = 0; k < 10; k += 1) {
+      const id = k + 1;
+      const createdAt = addMs('2026-09-29T00:00:00Z', k * 3600000);
+      runs.push({ id, created_at: createdAt, head_sha: `sha${id}`, event: 'push' });
+      jobsByRunId[id] = [
+        winJobFromMs(1, 3, 25.2 * 60000, { start: createdAt }),
+        winJobFromMs(2, 3, 29.0 * 60000, { start: createdAt }),
+        winJobFromMs(3, 3, 31.6 * 60000, { start: createdAt }),
+      ];
+    }
+    return { runs, jobsByRunId };
+  }
+
+  await t.test('a breach opens one tracking issue', async () => {
+    const { runs, jobsByRunId } = breachFixture();
+    const { github, calls } = makeGithub({ runs, jobsByRunId, existingIssues: [] });
+    const { core, warnings } = makeCore();
+
+    const result = await checkShardBalance({ github, context, core, config: THREE_SHARD_CONFIG });
+
+    assert.equal(result.status, 'breach');
+    assert.equal(calls.create.length, 1);
+    assert.equal(calls.create[0].title, THREE_SHARD_CONFIG.issueTitle);
+    assert.ok(calls.create[0].body.length > 0);
+    assert.equal(calls.comment.length, 0);
+    assert.equal(result.issue.action, 'created');
+    assert.equal(result.issue.number, 999);
+    assert.equal(warnings.length >= 1, true);
+  });
+
+  await t.test('a breach comments on the open tracking issue', async () => {
+    const { runs, jobsByRunId } = breachFixture();
+    const existingIssues = [{ number: 555, title: THREE_SHARD_CONFIG.issueTitle }];
+    const { github, calls } = makeGithub({ runs, jobsByRunId, existingIssues });
+    const { core } = makeCore();
+
+    const result = await checkShardBalance({ github, context, core, config: THREE_SHARD_CONFIG });
+
+    assert.equal(calls.comment.length, 1);
+    assert.equal(calls.comment[0].issue_number, 555);
+    assert.equal(calls.create.length, 0);
+    assert.equal(result.issue.action, 'commented');
+    assert.equal(result.issue.number, 555);
+  });
+
+  await t.test('a near-miss search hit or a PR is not treated as the tracking issue', async () => {
+    const { runs, jobsByRunId } = breachFixture();
+    const existingIssues = [
+      { number: 1, title: `${THREE_SHARD_CONFIG.issueTitle} (old)` },
+      { number: 2, title: THREE_SHARD_CONFIG.issueTitle, pull_request: {} },
+    ];
+    const { github, calls } = makeGithub({ runs, jobsByRunId, existingIssues });
+    const { core } = makeCore();
+
+    const result = await checkShardBalance({ github, context, core, config: THREE_SHARD_CONFIG });
+
+    assert.equal(calls.create.length, 1);
+    assert.equal(calls.comment.length, 0);
+    assert.equal(result.issue.action, 'created');
+  });
+
+  await t.test('ok and insufficient-data write no issue', async () => {
+    const okRuns = [];
+    const okJobsByRunId = {};
+    for (let k = 0; k < 10; k += 1) {
+      const id = k + 1;
+      const createdAt = addMs('2026-09-29T00:00:00Z', k * 3600000);
+      okRuns.push({ id, created_at: createdAt, head_sha: `sha${id}`, event: 'push' });
+      okJobsByRunId[id] = [
+        winJobFromMs(1, 3, 1200000, { start: createdAt }),
+        winJobFromMs(2, 3, 1200000, { start: createdAt }),
+        winJobFromMs(3, 3, 1200000, { start: createdAt }),
+      ];
+    }
+    const { github: okGithub, calls: okCalls } = makeGithub({ runs: okRuns, jobsByRunId: okJobsByRunId });
+    const { core: okCore } = makeCore();
+    const okResult = await checkShardBalance({ github: okGithub, context, core: okCore, config: THREE_SHARD_CONFIG });
+    assert.equal(okResult.status, 'ok');
+    assert.equal(okCalls.create.length, 0);
+    assert.equal(okCalls.comment.length, 0);
+
+    const insufficientRuns = okRuns.slice(0, 5);
+    const { github: insufficientGithub, calls: insufficientCalls } = makeGithub({
+      runs: insufficientRuns,
+      jobsByRunId: okJobsByRunId,
+    });
+    const { core: insufficientCore } = makeCore();
+    const insufficientResult = await checkShardBalance({
+      github: insufficientGithub, context, core: insufficientCore, config: THREE_SHARD_CONFIG,
+    });
+    assert.equal(insufficientResult.status, 'insufficient-data');
+    assert.equal(insufficientCalls.create.length, 0);
+    assert.equal(insufficientCalls.comment.length, 0);
+  });
+
+  // #5029: the live config right after #5029 merges. SHARD_BALANCE already
+  // describes its layout, but every completed `next` push run in the window
+  // is still a 3-shard one. Once the baseline's layout has minRuns runs of its
+  // own, a newer run on another layout is a real mismatch and files the issue.
+  function layoutRuns(count, total, { startId, base }) {
+    const runs = [];
+    const jobsByRunId = {};
+    for (let k = 0; k < count; k += 1) {
+      const id = startId + k;
+      const createdAt = addMs(base, k * 3600000);
+      runs.push({ id, created_at: createdAt, head_sha: `sha${id}`, event: 'push' });
+      jobsByRunId[id] = Array.from({ length: total }, (_, i) => winJobFromMs(i + 1, total, 1200000, { start: createdAt }));
+    }
+    return { runs, jobsByRunId };
+  }
+
+  const previousLayout = 3;
+
+  await t.test('the runs before a re-shard\'s first new-layout run file no issue (#5029)', async () => {
+    assert.notEqual(SHARD_BALANCE.baselineShardTotal, previousLayout, 'fixture precondition: the live layout is not the previous one');
+    const { runs, jobsByRunId } = layoutRuns(SHARD_BALANCE.windowRuns, previousLayout, { startId: 1, base: '2026-10-01T00:00:00Z' });
+    const { github, calls } = makeGithub({ runs, jobsByRunId });
+    const { core } = makeCore();
+
+    const result = await checkShardBalance({ github, context, core, config: SHARD_BALANCE });
+
+    assert.equal(result.status, 'insufficient-data');
+    assert.equal(calls.create.length, 0);
+    assert.equal(calls.comment.length, 0);
+  });
+
+  await t.test('a lane that moves off an established baseline layout files the issue (#5029)', async () => {
+    assert.notEqual(SHARD_BALANCE.baselineShardTotal, previousLayout, 'fixture precondition: the live layout is not the previous one');
+    const established = layoutRuns(SHARD_BALANCE.minRuns, SHARD_BALANCE.baselineShardTotal, { startId: 1, base: '2026-10-01T00:00:00Z' });
+    const moved = layoutRuns(2, previousLayout, { startId: 101, base: '2026-10-05T00:00:00Z' });
+    const { github, calls } = makeGithub({
+      runs: [...established.runs, ...moved.runs],
+      jobsByRunId: { ...established.jobsByRunId, ...moved.jobsByRunId },
+    });
+    const { core } = makeCore();
+
+    const result = await checkShardBalance({ github, context, core, config: SHARD_BALANCE });
+
+    assert.equal(result.status, 'baseline-mismatch');
+    assert.equal(calls.create.length, 1);
+    assert.equal(result.issue.action, 'created');
+  });
+
+  await t.test('an API failure is reported, not thrown', async () => {
+    const { core, warnings } = makeCore();
+    const { github } = makeGithub({ runs: [], jobsByRunId: {}, failListRuns: true });
+
+    const result = await checkShardBalance({ github, context, core, config: THREE_SHARD_CONFIG });
+
+    assert.equal(result.status, 'error');
+    assert.equal(warnings.length >= 1, true);
+  });
+
+  await t.test('run listing stops paging once enough runs are collected', async () => {
+    const totalRuns = 200;
+    const allRuns = [];
+    const jobsByRunId = {};
+    for (let k = 0; k < totalRuns; k += 1) {
+      const id = totalRuns - k;
+      const createdAt = addMs(THREE_SHARD_CONFIG.since, (totalRuns - k) * 3600000);
+      allRuns.push({ id, created_at: createdAt, head_sha: `sha${id}`, event: 'push' });
+      jobsByRunId[id] = [
+        winJobFromMs(1, 3, 1200000, { start: createdAt }),
+        winJobFromMs(2, 3, 1200000, { start: createdAt }),
+        winJobFromMs(3, 3, 1200000, { start: createdAt }),
+      ];
+    }
+    // allRuns is newest-first (highest id / latest created_at first).
+
+    let runListingPages = 0;
+    const github = {
+      paginate: async (fn, params, mapFn) => {
+        const out = [];
+        let stopped = false;
+        const done = () => { stopped = true; };
+        for (let page = 0; !stopped; page += 1) {
+          const data = await fn({ ...params, page });
+          if (data.length === 0) break;
+          out.push(...(mapFn ? mapFn({ data }, done) : data));
+        }
+        return out;
+      },
+      rest: {
+        actions: {
+          listWorkflowRuns: async (p) => {
+            runListingPages += 1;
+            const page = p.page || 0;
+            return allRuns.slice(page * p.per_page, (page + 1) * p.per_page);
+          },
+          listJobsForWorkflowRun: async (p) => (
+            (p.page || 0) === 0 ? jobsByRunId[p.run_id] : []
+          ),
+        },
+        search: {
+          issuesAndPullRequests: async () => ({ data: { items: [] } }),
+        },
+        issues: {
+          create: async () => ({ data: { number: 999 } }),
+          createComment: async () => ({ data: {} }),
+        },
+      },
+    };
+    const { core } = makeCore();
+
+    const result = await checkShardBalance({ github, context, core, config: THREE_SHARD_CONFIG });
+
+    const runLimit = THREE_SHARD_CONFIG.windowRuns * 2;
+    const expectedPages = Math.ceil(runLimit / Math.min(100, runLimit));
+    assert.equal(runListingPages, expectedPages);
+    assert.equal(result.status, 'ok');
+    assert.equal(result.runs, THREE_SHARD_CONFIG.windowRuns);
+  });
+});
+
+// #5029: SHARD_BALANCE's baselines are keyed by the windows shard layout, and
+// a layout it does not describe makes the daily report open a
+// "baseline-mismatch" issue on `next`. #5029 resharded the lane 3 -> 6 without
+// updating it, which only review caught. Derived from the workflow rather than
+// pinned, so the next reshard fails here, in the PR, instead of on `next`.
+test('SHARD_BALANCE matches the windows shard layout test.yml declares (#5029)', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const yaml = require('js-yaml');
+  const workflow = yaml.load(
+    fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', SHARD_BALANCE.workflowFile), 'utf8'),
+  );
+  const total = declaredWindowsConformanceShards(workflow);
+
+  assert.equal(
+    SHARD_BALANCE.baselineShardTotal, total,
+    `test.yml shards windows conformance ${total} ways but SHARD_BALANCE.baselineShardTotal is `
+    + `${SHARD_BALANCE.baselineShardTotal}: re-measure baselineP90Ms for the new layout (never scale).`,
+  );
+  const expectedKeys = Array.from({ length: total }, (_, i) => `${i + 1}/${total}`);
+  assert.deepEqual(Object.keys(SHARD_BALANCE.baselineP90Ms).sort(), [...expectedKeys].sort());
+  for (const key of expectedKeys) {
+    const baseline = SHARD_BALANCE.baselineP90Ms[key];
+    assert.ok(
+      Number.isInteger(baseline) && baseline > 0,
+      `baselineP90Ms['${key}'] must be a positive integer (milliseconds), got ${baseline}`,
+    );
+  }
+});
+
+// #5029: the live gap limit is sized for the layout test.yml declares (the
+// SHARD_BALANCE comment gives its rule, the read-ci-timeout-signals how-to its
+// measured basis). Boundary-tested against
+// the live config with a fixture on that layout: one millisecond under the
+// limit and the gap exactly at it are ok, one millisecond over is a breach.
+// Fixture values are derived from the config (the slow shard is the one with
+// the largest p90 baseline, and every shard stays at or under its baseline)
+// so a re-measured config keeps this test meaningful instead of breaking it.
+test('the live gap limit holds at its boundary on the declared shard layout (#5029)', () => {
+  const total = SHARD_BALANCE.baselineShardTotal;
+  const limit = SHARD_BALANCE.maxMedianGapMs;
+  const keys = Array.from({ length: total }, (_, i) => `${i + 1}/${total}`);
+  const baselines = keys.map((k) => SHARD_BALANCE.baselineP90Ms[k]);
+  const slowIdx = baselines.indexOf(Math.max(...baselines));
+  const base = baselines[slowIdx] - limit - 1;
+  assert.ok(
+    base > 0 && baselines.every((b) => b >= base),
+    `fixture precondition: every baseline must admit ${base} and the slowest must admit ${base + limit + 1}`,
+  );
+
+  const runsWithGap = (gap) => constantRuns(
+    SHARD_BALANCE.minRuns,
+    keys.map((_, i) => (i === slowIdx ? base + gap : base)),
+    { base: SHARD_BALANCE.since },
+  );
+  const underLimit = evaluateShardBalance(extractShardSamples(runsWithGap(limit - 1), SHARD_BALANCE), SHARD_BALANCE);
+  assert.equal(underLimit.status, 'ok');
+  assert.equal(underLimit.gapMs, limit - 1);
+
+  const atLimit = evaluateShardBalance(extractShardSamples(runsWithGap(limit), SHARD_BALANCE), SHARD_BALANCE);
+  assert.equal(atLimit.status, 'ok');
+  assert.equal(atLimit.gapMs, limit);
+
+  const overLimit = evaluateShardBalance(extractShardSamples(runsWithGap(limit + 1), SHARD_BALANCE), SHARD_BALANCE);
+  assert.equal(overLimit.status, 'breach');
+  assert.deepEqual(overLimit.breaches.map((b) => [b.kind, b.slowest]), [['gap', keys[slowIdx]]]);
+});
+
+// The threshold invariant (CONTEXT.md, RULESET.TESTS.property-based-testing).
+// The boundary rows above pin minRuns-1, minRuns and minRuns+1 on one fixture;
+// this holds the rule for any run history, in both directions, so a guard that
+// stops firing fails here as surely as one that fires too early. Samples arrive
+// shuffled because "newest" has to come from createdAt, not from array order.
+test('baseline-mismatch fires exactly when the lane left an established baseline layout (#5029)', () => {
+  const { baselineShardTotal, minRuns } = SHARD_BALANCE;
+  const samplesOf = (layouts) => layouts.flatMap((total, run) => Array.from({ length: total }, (_, i) => ({
+    runId: run + 1,
+    createdAt: new Date(Date.UTC(2026, 10, 1, run)).toISOString(),
+    index: i + 1,
+    total,
+    shard: `${i + 1}/${total}`,
+    elapsedMs: 600000,
+  })));
+  const otherLayout = fc.integer({ min: 1, max: 8 }).filter((total) => total !== baselineShardTotal);
+  const baselineRunsThenOthers = fc.tuple(
+    fc.oneof(fc.constantFrom(minRuns - 1, minRuns, minRuns + 1), fc.nat({ max: minRuns * 3 })),
+    fc.array(otherLayout, { maxLength: 6 }),
+  ).map(([baselineRuns, others]) => [...Array(baselineRuns).fill(baselineShardTotal), ...others]);
+  const anyHistory = fc.array(fc.oneof(otherLayout, fc.constant(baselineShardTotal)), { maxLength: 40 });
+  const history = fc.oneof(baselineRunsThenOthers, anyHistory).chain((layouts) => {
+    const samples = samplesOf(layouts);
+    return fc.shuffledSubarray(samples, { minLength: samples.length, maxLength: samples.length })
+      .map((shuffled) => ({ layouts, samples: shuffled }));
+  });
+
+  const seen = { mismatch: 0, withheld: 0, stayed: 0 };
+  fc.assert(fc.property(history, ({ layouts, samples }) => {
+    const baselineRuns = layouts.filter((total) => total === baselineShardTotal).length;
+    const moved = layouts.length > 0 && layouts[layouts.length - 1] !== baselineShardTotal;
+    const established = baselineRuns >= minRuns;
+    if (!moved) seen.stayed += 1;
+    else if (established) seen.mismatch += 1;
+    else seen.withheld += 1;
+
+    const { status } = evaluateShardBalance(samples, SHARD_BALANCE);
+    assert.equal(
+      status === 'baseline-mismatch', moved && established,
+      `layouts ${JSON.stringify(layouts)} gave status ${status}`,
+    );
+  }), { numRuns: 300 });
+
+  assert.ok(
+    seen.mismatch > 0 && seen.withheld > 0 && seen.stayed > 0,
+    `the property must exercise every case, saw ${JSON.stringify(seen)}`,
+  );
+});
+
+// #6177: a job cancelled while it still waited for a runner never ran. GitHub's
+// jobs API gives it a started_at (queued) and a later completed_at (cancelled),
+// so the queue wait read as run time. Its shape is `cancelled` + an empty
+// `steps` + `runner_id` 0 + `runner_name` ''. The rule lives in jobSpanMs, so
+// both consumers (the near-cap record parser and the shard-sample extractor)
+// inherit it; an ABSENT field is not evidence the job never ran.
+test('a job cancelled before it got a runner has no duration (#6177)', async (t) => {
+  const yamlText = 'jobs:\n  test:\n    timeout-minutes: 45\n';
+  const start = '2026-09-29T10:00:00Z';
+  const NEVER_RAN = { steps: [], runner_id: 0, runner_name: '' };
+  const ubuntu = (extra) => ({
+    name: 'test (ubuntu-latest, 24, shard 4/6)',
+    run_id: 7,
+    head_sha: 'abc',
+    runEvent: 'push',
+    conclusion: 'cancelled',
+    started_at: start,
+    completed_at: addMs(start, 48 * 60000),
+    ...extra,
+  });
+  const parse = (job) => parseJobRecord({ job, workflowFile: 'test.yml', workflowYamlText: yamlText, covered: null });
+  const winShard = (extra) => ({ ...winJob(4, 6, 48, { start, conclusion: 'cancelled' }), ...extra });
+  const samplesOf = (job) => extractShardSamples([runAt(1, start, [job])], SHARD_BALANCE);
+
+  await t.test('a queue-cancelled job has no span and no history record', () => {
+    const job = ubuntu(NEVER_RAN);
+    assert.equal(jobSpanMs(job), null);
+    assert.equal(parse(job), null);
+  });
+
+  await t.test('a queue-cancelled shard yields no shard sample', () => {
+    assert.equal(samplesOf(winShard(NEVER_RAN)).length, 0);
+  });
+
+  await t.test('step-count boundary: 0 steps never ran, 1 step ran', () => {
+    assert.equal(jobSpanMs(ubuntu({ ...NEVER_RAN, steps: [] })), null);
+    assert.equal(jobSpanMs(ubuntu({ ...NEVER_RAN, steps: [{ name: 'Set up job' }] })), 48 * 60000);
+    assert.equal(samplesOf(winShard({ ...NEVER_RAN, steps: [{ name: 'Set up job' }] })).length, 1);
+  });
+
+  await t.test('runner boundaries: id 0 and empty name never ran, id 1 and a named runner ran', () => {
+    assert.equal(jobSpanMs(ubuntu({ ...NEVER_RAN, runner_id: 1 })), 48 * 60000);
+    assert.equal(jobSpanMs(ubuntu({ ...NEVER_RAN, runner_name: 'GitHub Actions 5' })), 48 * 60000);
+    assert.equal(jobSpanMs(ubuntu({ ...NEVER_RAN, runner_id: 0, runner_name: '' })), null);
+  });
+
+  await t.test('a cancelled record without steps, runner id and runner name is still counted', () => {
+    const job = ubuntu({});
+    assert.equal(jobSpanMs(job), 48 * 60000);
+    assert.ok(parse(job));
+    assert.equal(samplesOf(winShard({})).length, 1);
+  });
+
+  await t.test('a cancelled record missing any one of the three signals is still counted', () => {
+    for (const dropped of ['steps', 'runner_id', 'runner_name']) {
+      const partial = { ...NEVER_RAN };
+      delete partial[dropped];
+      assert.equal(jobSpanMs(ubuntu(partial)), 48 * 60000, `missing ${dropped}`);
+    }
+  });
+
+  await t.test('the rule keys on a cancelled conclusion', () => {
+    for (const conclusion of ['failure', 'success']) {
+      assert.equal(jobSpanMs(ubuntu({ ...NEVER_RAN, conclusion })), 48 * 60000, conclusion);
+    }
+  });
+
+  await t.test('a cancelled job that ran to its cap is still counted by every consumer', () => {
+    const ran = { steps: [{ name: 'Run tests' }], runner_id: 77, runner_name: 'GitHub Actions 77' };
+    const capped = ubuntu({ ...ran, completed_at: addMs(start, 45 * 60000) });
+    const rec = parse(capped);
+    assert.ok(rec);
+    assert.equal(rec.pct, 1);
+    assert.equal(samplesOf(winShard({ ...ran, completed_at: addMs(start, 45 * 60000) })).length, 1);
+  });
+});

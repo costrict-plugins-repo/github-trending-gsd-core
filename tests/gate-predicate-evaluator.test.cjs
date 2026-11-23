@@ -1,0 +1,543 @@
+'use strict';
+
+/**
+ * Unit tests for the gate-predicate evaluator (pure core) — issue #2008.
+ *
+ * The evaluator is a pure, deps-injected function:
+ *   evaluatePredicate(predicate, context, deps) -> { block, message, details? }
+ * Malformed predicates / unknown kinds THROW (the CLI wrapper maps a throw to a
+ * check-command failure so the workflow's `onError` step-1 contract applies).
+ *
+ * Built-in kind: `command-exit-zero` — runs a declared command via an injected
+ * bounded-shell seam; exit 0 => pass, non-zero => block, timeout => block.
+ *
+ * Per RULESET.TESTS.boundary-coverage: exit code boundary (0/1/2), timedOut
+ * true/false, message-trim boundary (MAX / MAX+1), timeout pass-through.
+ * Per RULESET.TESTS.property-based: interpolation bijection property (fast-check).
+ */
+
+const { describe, test } = require('node:test');
+const assert = require('node:assert/strict');
+const fc = require('./helpers/fast-check-setup.cjs');
+
+const {
+  evaluatePredicate,
+  COMMAND_EXIT_ZERO_DEFAULT_TIMEOUT_MS,
+  COMMAND_MAX_OUTPUT_CHARS,
+  COMMAND_MAX_LENGTH,
+  EVALUATOR_KINDS,
+} = require('../gsd-core/bin/lib/gate-predicate-evaluator.cjs');
+
+/**
+ * NOT a subprocess spawn timeout. Fixture DATA: an arbitrary declarative
+ * `timeout` value (seconds) feeding a canned timedOut:true fake-shell
+ * response -- the value itself is not asserted on, only the resulting
+ * block/message behavior.
+ */
+const PREDICATE_TIMEOUT_FIXTURE_SECONDS = 5;
+/**
+ * NOT a subprocess spawn timeout. Fixture DATA: specifically tests the
+ * predicate's own seconds-to-milliseconds conversion -- the assertion
+ * below checks the converted value is exactly this times 1000.
+ */
+const PREDICATE_TIMEOUT_CUSTOM_SECONDS = 90;
+/** NOT a subprocess spawn timeout. Fixture DATA: a deliberately-invalid (zero) declarative timeout value, proving the predicate validator rejects a non-positive timeout. */
+const INVALID_PREDICATE_TIMEOUT_ZERO = 0;
+/** NOT a subprocess spawn timeout. Fixture DATA: a deliberately-invalid (negative) declarative timeout value, proving the predicate validator rejects a non-positive timeout. */
+const INVALID_PREDICATE_TIMEOUT_NEGATIVE = -5;
+
+// ─── Fake bounded-shell seam ──────────────────────────────────────────────────
+
+/** Build a fake runBoundedShell that records the invocation and returns a preset result. */
+function fakeShell(preset) {
+  const calls = [];
+  const run = (opts) => {
+    calls.push(opts);
+    return {
+      exitCode: preset.exitCode ?? 0,
+      stdout: preset.stdout ?? '',
+      stderr: preset.stderr ?? '',
+      signal: preset.signal ?? null,
+      timedOut: preset.timedOut ?? false,
+    };
+  };
+  return { run, calls };
+}
+
+const baseCtx = { cwd: '/proj', phaseNumber: '03', phaseDir: '/proj/.planning/phases/03-x', phaseReqIds: 'R-1' };
+
+// ─── command-exit-zero: exit-code boundary (0 / 1 / 2) ─────────────────────────
+
+describe('evaluatePredicate — command-exit-zero exit mapping', () => {
+  test('exit 0 => block:false (gate passes)', () => {
+    const shell = fakeShell({ exitCode: 0 });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'true' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.block, false);
+    assert.match(res.message, /exit/i);
+  });
+
+  test('exit 1 => block:true', () => {
+    const shell = fakeShell({ exitCode: 1, stderr: 'boom' });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'false' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.block, true);
+    assert.match(res.message, /1/);
+    assert.match(res.message, /boom/);
+  });
+
+  test('exit 2 => block:true (boundary above 1)', () => {
+    const shell = fakeShell({ exitCode: 2 });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'bad' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.block, true);
+  });
+
+  test('exit 127 (ENOENT) => block:true, surfaces not-found', () => {
+    const shell = fakeShell({ exitCode: 127, stderr: 'sh: not found' });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'nope' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.block, true);
+    assert.match(res.message, /not found|127/);
+  });
+
+  test('non-zero exit with empty stderr still yields a block message', () => {
+    const shell = fakeShell({ exitCode: 3, stderr: '', stdout: '' });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'x' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.block, true);
+    assert.match(res.message, /3/);
+  });
+});
+
+// ─── timeout ──────────────────────────────────────────────────────────────────
+
+describe('evaluatePredicate — command-exit-zero timeout', () => {
+  test('timedOut => block:true with timed-out message', () => {
+    const shell = fakeShell({ timedOut: true, exitCode: null, signal: 'SIGTERM' });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'sleep 100', timeout: PREDICATE_TIMEOUT_FIXTURE_SECONDS },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.block, true);
+    assert.match(res.message, /timed out|timeout/i);
+  });
+
+  test('default timeout applied when predicate.timeout absent', () => {
+    const shell = fakeShell({ exitCode: 0 });
+    evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'true' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(shell.calls[0].timeoutMs, COMMAND_EXIT_ZERO_DEFAULT_TIMEOUT_MS);
+  });
+
+  test('custom timeout (seconds) honored and converted to ms', () => {
+    const shell = fakeShell({ exitCode: 0 });
+    evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'true', timeout: PREDICATE_TIMEOUT_CUSTOM_SECONDS },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(shell.calls[0].timeoutMs, 90_000);
+  });
+});
+
+// ─── interpolation ────────────────────────────────────────────────────────────
+
+describe('evaluatePredicate — interpolation', () => {
+  test('${PHASE_DIR}, ${PHASE_NUMBER}, ${PHASE_REQ_IDS} are substituted', () => {
+    const shell = fakeShell({ exitCode: 0 });
+    evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'check ${PHASE_DIR} ${PHASE_NUMBER} ${PHASE_REQ_IDS}' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(
+      shell.calls[0].command,
+      'check /proj/.planning/phases/03-x 03 R-1',
+    );
+  });
+
+  test('undefined context var => empty string (no leftover placeholder)', () => {
+    const shell = fakeShell({ exitCode: 0 });
+    evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'check ${PHASE_REQ_IDS}' },
+      { cwd: '/proj' },
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(shell.calls[0].command, 'check ');
+  });
+
+  test('foreign ${HOME} placeholder left untouched (shell interprets)', () => {
+    const shell = fakeShell({ exitCode: 0 });
+    evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'echo ${HOME}' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(shell.calls[0].command, 'echo ${HOME}');
+  });
+});
+
+// ─── output trimming ──────────────────────────────────────────────────────────
+
+describe('evaluatePredicate — message trimming', () => {
+  test('stderr longer than COMMAND_MAX_OUTPUT_CHARS is trimmed', () => {
+    const long = 'E'.repeat(COMMAND_MAX_OUTPUT_CHARS + 50);
+    const shell = fakeShell({ exitCode: 1, stderr: long });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'x' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.block, true);
+    assert.equal(res.message.length, COMMAND_MAX_OUTPUT_CHARS);
+  });
+
+  test('stderr exactly at COMMAND_MAX_OUTPUT_CHARS is trimmed to fit the exit prefix (boundary)', () => {
+    const exact = 'E'.repeat(COMMAND_MAX_OUTPUT_CHARS);
+    const shell = fakeShell({ exitCode: 1, stderr: exact });
+    const res = evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'x' },
+      baseCtx,
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(res.message.length, COMMAND_MAX_OUTPUT_CHARS);
+  });
+
+  // #5593: ADR-2008 says the message keeps the TAIL of the output (errors land last).
+  const run = (shellResult, command = 'x') => evaluatePredicate(
+    { kind: 'command-exit-zero', command },
+    baseCtx,
+    { runBoundedShell: fakeShell(shellResult).run },
+  );
+
+  const exitPrefix = (code) => `command exited ${code}: `;
+  const TIMEOUT_PREFIX = 'command timed out after 30s: ';
+
+  const assertCappedTail = (res, prefix, filler) => {
+    const tail = filler.repeat(COMMAND_MAX_OUTPUT_CHARS - prefix.length - 'MARKER'.length) + 'MARKER';
+    assert.equal(res.message, prefix + tail);
+  };
+
+  test('non-zero exit keeps the stderr tail and the exit prefix within the cap', () => {
+    assertCappedTail(run({ exitCode: 3, stderr: 'E'.repeat(COMMAND_MAX_OUTPUT_CHARS + 50) + 'MARKER' }), exitPrefix(3), 'E');
+  });
+
+  test('non-zero exit keeps the stdout tail when stderr is empty', () => {
+    assertCappedTail(
+      run({ exitCode: 2, stderr: '', stdout: 'O'.repeat(COMMAND_MAX_OUTPUT_CHARS + 50) + 'MARKER' }),
+      exitPrefix(2),
+      'O',
+    );
+  });
+
+  test('timeout keeps the stderr tail and the timeout prefix within the cap', () => {
+    assertCappedTail(
+      run({ timedOut: true, exitCode: null, stderr: 'E'.repeat(COMMAND_MAX_OUTPUT_CHARS + 50) + 'MARKER' }),
+      TIMEOUT_PREFIX,
+      'E',
+    );
+  });
+
+  test('timeout with empty stderr keeps the HEAD of a long command (program name survives)', () => {
+    const command = 'myprog --flag ' + 'a'.repeat(COMMAND_MAX_OUTPUT_CHARS) + ' TAILEND';
+    const res = run({ timedOut: true, exitCode: null, stderr: '' }, command);
+    const head = command.slice(0, COMMAND_MAX_OUTPUT_CHARS - TIMEOUT_PREFIX.length);
+    assert.equal(res.message, TIMEOUT_PREFIX + head);
+  });
+
+  test('tail cut between an emoji surrogate pair drops the orphaned low surrogate', () => {
+    const prefix = exitPrefix(3);
+    const budget = COMMAND_MAX_OUTPUT_CHARS - prefix.length;
+    // slice(-budget) starts exactly on the emoji's low surrogate.
+    const stderr = 'E'.repeat(10) + '\u{1F600}' + 'T'.repeat(budget - 7) + 'MARKER';
+    const tail = run({ exitCode: 3, stderr }).message.slice(prefix.length);
+    assert.equal(tail, 'T'.repeat(budget - 7) + 'MARKER');
+  });
+
+  // prefix.length + output.length at {cap-1, cap, cap+1}: only cap+1 may cut, and by exactly one char.
+  for (const [label, prefix, mk] of [
+    ['non-zero exit', exitPrefix(3), (stderr) => ({ exitCode: 3, stderr })],
+    ['timeout', TIMEOUT_PREFIX, (stderr) => ({ timedOut: true, exitCode: null, stderr })],
+  ]) {
+    for (const delta of [-1, 0, 1]) {
+      test(`${label}: prefix + output length = cap${delta >= 0 ? '+' : ''}${delta}`, () => {
+        const len = COMMAND_MAX_OUTPUT_CHARS - prefix.length + delta;
+        const out = 'a'.repeat(len - 1) + 'Z';
+        const { message } = run(mk(out));
+        assert.equal(message.length, Math.min(prefix.length + len, COMMAND_MAX_OUTPUT_CHARS));
+        assert.equal(message, prefix + out.slice(-(COMMAND_MAX_OUTPUT_CHARS - prefix.length)));
+      });
+    }
+  }
+
+  test('timeout with empty stderr does not end on a lone high surrogate', () => {
+    const prefix = TIMEOUT_PREFIX;
+    const budget = COMMAND_MAX_OUTPUT_CHARS - prefix.length;
+    const command = 'a'.repeat(budget - 1) + '\u{1F600}tail';
+    const { message } = run({ timedOut: true, exitCode: null, stderr: '' }, command);
+    assert.ok(!/[\uD800-\uDBFF]$/.test(message));
+    assert.ok(message.length <= COMMAND_MAX_OUTPUT_CHARS);
+  });
+
+  test('timeout with empty stderr keeps a short command that genuinely ends in a lone high surrogate', () => {
+    const command = 'echo \uD83D';
+    assert.equal(run({ timedOut: true, exitCode: null, stderr: '' }, command).message, `${TIMEOUT_PREFIX}${command}`);
+  });
+
+  // Head branch (timeout, empty stderr): prefix + command length at {cap-1, cap, cap+1}; only cap+1 may cut.
+  for (const delta of [-1, 0, 1]) {
+    test(`timeout head: prefix + command length = cap${delta >= 0 ? '+' : ''}${delta}`, () => {
+      const prefix = TIMEOUT_PREFIX;
+      const len = COMMAND_MAX_OUTPUT_CHARS - prefix.length + delta;
+      const command = 'A' + 'a'.repeat(len - 1);
+      const { message } = run({ timedOut: true, exitCode: null, stderr: '' }, command);
+      assert.equal(message, prefix + command.slice(0, COMMAND_MAX_OUTPUT_CHARS - prefix.length));
+      assert.equal(message.length, Math.min(prefix.length + len, COMMAND_MAX_OUTPUT_CHARS));
+    });
+  }
+
+  test('property: message never exceeds the cap and keeps the output tail', () => {
+    fc.assert(
+      fc.property(
+        fc.string({ unit: 'binary', maxLength: COMMAND_MAX_OUTPUT_CHARS + 200 }),
+        fc.integer({ min: 1, max: 255 }),
+        (output, exitCode) => {
+          const { message } = run({ exitCode, stderr: output });
+          const prefix = exitPrefix(exitCode);
+          if (message.length > COMMAND_MAX_OUTPUT_CHARS) return false;
+          if (output.trim() === '') return message === `command exited ${exitCode}`;
+          const kept = message.slice(prefix.length);
+          // a cut may drop one orphaned low surrogate, never more
+          return output.endsWith(kept) && (kept.length === output.length || kept.length >= COMMAND_MAX_OUTPUT_CHARS - prefix.length - 1);
+        },
+      ),
+    );
+  });
+
+  // Well-formed input (astral chars make cuts land mid-pair) must yield a well-formed message on every path.
+  const wellFormed = fc.string({
+    unit: fc.constantFrom('a', 'b', '\u{1F600}'),
+    minLength: COMMAND_MAX_OUTPUT_CHARS - 40,
+    maxLength: COMMAND_MAX_OUTPUT_CHARS + 40,
+  });
+
+  test('property: a cut never leaves a lone surrogate on any path (exit/stdout/timeout stderr/timeout head)', () => {
+    fc.assert(
+      fc.property(wellFormed, (text) => {
+        for (const [shell, command] of [
+          [{ exitCode: 3, stderr: text }],
+          [{ exitCode: 3, stderr: '', stdout: text }],
+          [{ timedOut: true, exitCode: null, stderr: text }],
+          [{ timedOut: true, exitCode: null, stderr: '' }, text],
+        ]) {
+          const { message } = run(shell, command);
+          if (message.length > COMMAND_MAX_OUTPUT_CHARS || !message.isWellFormed()) return false;
+        }
+        return true;
+      }),
+    );
+  });
+
+  test('property: timeout stderr and stdout fallback keep the output tail within the cap', () => {
+    fc.assert(
+      fc.property(fc.string({ unit: 'binary', minLength: 1, maxLength: COMMAND_MAX_OUTPUT_CHARS + 200 }).filter((o) => o.trim() !== ''), (output) => {
+        for (const [shell, prefix] of [
+          [{ timedOut: true, exitCode: null, stderr: output }, TIMEOUT_PREFIX],
+          [{ exitCode: 3, stderr: '', stdout: output }, exitPrefix(3)],
+        ]) {
+          const { message } = run(shell);
+          const kept = message.slice(prefix.length);
+          if (message.length > COMMAND_MAX_OUTPUT_CHARS || !message.startsWith(prefix) || !output.endsWith(kept)) return false;
+          // the whole tail that fits is kept (a cut may drop one orphaned low surrogate)
+          if (kept.length !== output.length && kept.length < COMMAND_MAX_OUTPUT_CHARS - prefix.length - 1) return false;
+        }
+        return true;
+      }),
+    );
+  });
+
+  test('whitespace-only stderr falls back to stdout on exit', () => {
+    assert.equal(run({ exitCode: 1, stderr: ' \n', stdout: 'real error' }).message, `${exitPrefix(1)}real error`);
+  });
+
+  test('whitespace-only stderr on timeout shows the command head, not stdout', () => {
+    assert.equal(
+      run({ timedOut: true, exitCode: null, stderr: '\t\n', stdout: 'ignored' }, 'myprog').message,
+      `${TIMEOUT_PREFIX}myprog`,
+    );
+  });
+
+  test('whitespace-only stderr and stdout give the bare exit message', () => {
+    assert.equal(run({ exitCode: 1, stderr: ' ', stdout: '\n' }).message, 'command exited 1');
+  });
+
+  test('oversized prefix never pushes the message over the cap', () => {
+    const code = 'x'.repeat(COMMAND_MAX_OUTPUT_CHARS + 5);
+    const { message } = run({ exitCode: code, stderr: 'boom' });
+    assert.equal(message, `command exited ${code}: `.slice(0, COMMAND_MAX_OUTPUT_CHARS));
+  });
+
+  test('prefix at cap-1, cap and cap+1 units: one text unit, prefix whole, prefix cut', () => {
+    const codeFor = (prefixLen) => 'x'.repeat(prefixLen - exitPrefix('').length);
+    const at = (prefixLen) => run({ exitCode: codeFor(prefixLen), stderr: 'boom' }).message;
+    const cap = COMMAND_MAX_OUTPUT_CHARS;
+    assert.equal(at(cap - 1), exitPrefix(codeFor(cap - 1)) + 'm');
+    assert.equal(at(cap), exitPrefix(codeFor(cap)));
+    assert.equal(at(cap + 1), exitPrefix(codeFor(cap + 1)).slice(0, cap));
+  });
+
+  test('short output is kept whole after the prefix', () => {
+    assert.equal(run({ exitCode: 1, stderr: 'boom' }).message, `${exitPrefix(1)}boom`);
+  });
+
+  test('empty output yields no colon', () => {
+    assert.equal(run({ exitCode: 1, stderr: '', stdout: '' }).message, 'command exited 1');
+  });
+});
+
+// ─── malformed predicate / fail-closed ────────────────────────────────────────
+
+describe('evaluatePredicate — malformed predicate throws (maps to check-cmd failure)', () => {
+  test('missing command throws', () => {
+    assert.throws(
+      () => evaluatePredicate({ kind: 'command-exit-zero' }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /command/i,
+    );
+  });
+
+  test('non-string command throws', () => {
+    assert.throws(
+      () => evaluatePredicate({ kind: 'command-exit-zero', command: 42 }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /command/i,
+    );
+  });
+
+  test('empty-string command throws', () => {
+    assert.throws(
+      () => evaluatePredicate({ kind: 'command-exit-zero', command: '   ' }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /command/i,
+    );
+  });
+
+  test('oversized command throws (ARGV-overflow guard)', () => {
+    const huge = 'a'.repeat(COMMAND_MAX_LENGTH + 1);
+    assert.throws(
+      () => evaluatePredicate({ kind: 'command-exit-zero', command: huge }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /max length/i,
+    );
+  });
+
+  test('non-positive timeout throws', () => {
+    assert.throws(
+      () => evaluatePredicate({ kind: 'command-exit-zero', command: 'x', timeout: INVALID_PREDICATE_TIMEOUT_ZERO }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /timeout/i,
+    );
+    assert.throws(
+      () => evaluatePredicate({ kind: 'command-exit-zero', command: 'x', timeout: INVALID_PREDICATE_TIMEOUT_NEGATIVE }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /timeout/i,
+    );
+  });
+
+  test('non-finite timeout throws', () => {
+    assert.throws(
+      () => evaluatePredicate({ kind: 'command-exit-zero', command: 'x', timeout: 'forever' }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /timeout/i,
+    );
+  });
+
+  test('unknown kind throws', () => {
+    assert.throws(
+      () => evaluatePredicate({ kind: 'no-such-kind', command: 'x' }, baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /kind|unknown|no-such-kind/i,
+    );
+  });
+
+  test('predicate not an object throws', () => {
+    assert.throws(
+      () => evaluatePredicate('nope', baseCtx, { runBoundedShell: fakeShell({}).run }),
+      /predicate/i,
+    );
+  });
+});
+
+// ─── contract surface ─────────────────────────────────────────────────────────
+
+describe('evaluatePredicate — exported contract surface', () => {
+  test('EVALUATOR_KINDS advertises every built-in predicate kind', () => {
+    assert.ok(Array.isArray(EVALUATOR_KINDS));
+    assert.ok(EVALUATOR_KINDS.includes('command-exit-zero'));
+    assert.ok(EVALUATOR_KINDS.includes('artifact-frontmatter-equals'));
+  });
+
+  test('default timeout is 30s', () => {
+    assert.equal(COMMAND_EXIT_ZERO_DEFAULT_TIMEOUT_MS, 30_000);
+  });
+
+  test('cwd is passed through to the shell seam', () => {
+    const shell = fakeShell({ exitCode: 0 });
+    evaluatePredicate(
+      { kind: 'command-exit-zero', command: 'true' },
+      { cwd: '/custom/proj' },
+      { runBoundedShell: shell.run },
+    );
+    assert.equal(shell.calls[0].cwd, '/custom/proj');
+  });
+});
+
+// ─── property-based: interpolation bijection on non-placeholder strings ───────
+
+describe('evaluatePredicate — interpolation property (fast-check)', () => {
+  test('strings without the 3 placeholders pass through unchanged', () => {
+    fc.assert(
+      fc.property(
+        fc.string({ maxLength: 40 }).filter((s) => s.trim().length > 0 && !/\$\{(PHASE_NUMBER|PHASE_DIR|PHASE_REQ_IDS)\}/.test(s)),
+        (cmd) => {
+        const shell = fakeShell({ exitCode: 0 });
+        evaluatePredicate(
+          { kind: 'command-exit-zero', command: cmd },
+          baseCtx,
+          { runBoundedShell: shell.run },
+        );
+        // sh -c receives exactly the input; only the 3 known placeholders would have been rewritten.
+        assert.equal(shell.calls[0].command, cmd);
+      }),
+      { numRuns: 100 },
+    );
+  });
+
+  test('every placeholder is fully replaced (no leftover ${PHASE_*})', () => {
+    fc.assert(
+      fc.property(fc.string({ maxLength: 20 }), (noise) => {
+        const cmd = `${noise} ${noise}`;
+        const shell = fakeShell({ exitCode: 0 });
+        evaluatePredicate(
+          { kind: 'command-exit-zero', command: `\${PHASE_DIR}${cmd}\${PHASE_NUMBER}` },
+          baseCtx,
+          { runBoundedShell: shell.run },
+        );
+        assert.doesNotMatch(shell.calls[0].command, /\$\{PHASE_(DIR|NUMBER|REQ_IDS)\}/);
+      }),
+      { numRuns: 100 },
+    );
+  });
+});
